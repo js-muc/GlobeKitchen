@@ -69,30 +69,20 @@ function getFilters(q: any) {
 // ---------- Routes ----------
 
 /** GET /api/stock-movements
- *  Query:
- *   - itemId?: number
- *   - direction?: IN|OUT
- *   - page?: number
- *   - limit?: number   (alias for pageSize)
- *   - pageSize?: number
- *   - sort?: createdAt|id|quantity|unitCost
- *   - order?: asc|desc
+ * Query:
+ *  - itemId?: number
+ *  - direction?: IN|OUT
+ *  - page?: number (default 1)
+ *  - limit?: number (default 20, max 100)  // pageSize accepted as alias
+ *  - sort?: createdAt|id|quantity|unitCost (default createdAt)
+ *  - order?: asc|desc (default desc)
+ * Response: { data: StockMovement[], meta: { total, page, limit, pages, hasNext, hasPrev } }
  */
 r.get("/", async (req, res) => {
   const { where } = getFilters(req.query);
   const { sort, order } = getSortParams(req.query);
-  const { hasPaging, page, limit, pageSize, skip, take } = getPageParams(req.query);
+  const { page, limit, skip, take } = getPageParams(req.query); // always paginate
 
-  if (!hasPaging) {
-    // Original behavior (preserved): plain array without pagination/meta
-    const rows = await prisma.stockMovement.findMany({
-      where,
-      orderBy: { [sort]: order },
-    });
-    return res.json(rows);
-  }
-
-  // Paginated response
   const [rows, total] = await Promise.all([
     prisma.stockMovement.findMany({
       where,
@@ -103,11 +93,9 @@ r.get("/", async (req, res) => {
     prisma.stockMovement.count({ where }),
   ]);
 
-  return res.json({
-    data: rows,
-    meta: pageMeta(total, page, pageSize /* = limit */),
-  });
+  return res.json({ data: rows, meta: pageMeta(total, page, limit) });
 });
+
 
 /** POST /api/stock-movements */
 r.post("/", writeLimiter, validateBody(zStockMovementCreate), async (req, res) => {
