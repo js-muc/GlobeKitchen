@@ -84,14 +84,18 @@ model Conversion {
 
 model StockMovement {
   id        Int               @id @default(autoincrement())
-  item      MenuItem          @relation(fields: [itemId], references: [id])
   itemId    Int
   direction MovementDirection
-  quantity  Decimal           @db.Decimal(10, 2)
+  quantity  Int
   unitCost  Decimal?          @db.Decimal(10, 2)
   note      String?
   createdAt DateTime          @default(now())
+
+  @@index([itemId, createdAt])
+  @@index([direction])
+  @@index([createdAt])
 }
+
 
 model TableSale {
   id        Int       @id @default(autoincrement())
