@@ -1,0 +1,177 @@
+// =================== Prisma Config ===================
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =================== Enums ===================
+enum EmployeeRole {
+  KITCHEN
+  WAITER
+}
+
+enum EmployeeType {
+  INSIDE
+  FIELD
+  KITCHEN
+}
+
+enum TableCode {
+  A6
+  A7
+  A8
+  A9
+}
+
+enum MovementDirection {
+  IN
+  OUT
+}
+
+// =================== Models ===================
+model User {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique
+  password  String
+  createdAt DateTime @default(now())
+}
+
+model Employee {
+  id              Int                 @id @default(autoincrement())
+  name            String
+  role            EmployeeRole        @default(WAITER)
+  type            EmployeeType        @default(INSIDE)
+  tableCode       TableCode?
+  phone           String?
+  active          Boolean             @default(true)
+  createdAt       DateTime            @default(now())
+  salary          EmployeeSalaryMeta?
+  advances        Advance[]
+  deductions      Deduction[]
+  tableSales      TableSale[]
+  fieldDispatches FieldDispatch[]
+  Payout          Payout[]
+}
+
+model MenuItem {
+  id             Int             @id @default(autoincrement())
+  name           String          @unique
+  category       String?
+  unit           String          @default("unit")
+  priceSell      Decimal         @db.Decimal(10, 2)
+  costUnit       Decimal?        @db.Decimal(10, 2)
+  active         Boolean         @default(true)
+  createdAt      DateTime        @default(now())
+  stockMovements StockMovement[]
+  convFrom       Conversion[]    @relation("from")
+  convTo         Conversion[]    @relation("to")
+  TableSale      TableSale[]
+  FieldDispatch  FieldDispatch[]
+}
+
+model Conversion {
+  id         Int      @id @default(autoincrement())
+  fromItem   MenuItem @relation("from", fields: [fromItemId], references: [id])
+  fromItemId Int
+  toItem     MenuItem @relation("to", fields: [toItemId], references: [id])
+  toItemId   Int
+  factor     Decimal  @db.Decimal(10, 2) // e.g. thermos->cups (10 or 9)
+}
+
+model StockMovement {
+  id        Int               @id @default(autoincrement())
+  item      MenuItem          @relation(fields: [itemId], references: [id])
+  itemId    Int
+  direction MovementDirection
+  quantity  Decimal           @db.Decimal(10, 2)
+  unitCost  Decimal?          @db.Decimal(10, 2)
+  note      String?
+  createdAt DateTime          @default(now())
+}
+
+model TableSale {
+  id        Int       @id @default(autoincrement())
+  date      DateTime
+  waiter    Employee  @relation(fields: [waiterId], references: [id])
+  waiterId  Int
+  tableCode TableCode
+  item      MenuItem  @relation(fields: [itemId], references: [id])
+  itemId    Int
+  qty       Decimal   @db.Decimal(10, 2)
+  priceEach Decimal   @db.Decimal(10, 2)
+  discount  Decimal   @default(0) @db.Decimal(10, 2)
+  lossQty   Decimal   @default(0) @db.Decimal(10, 2)
+  note      String?
+  createdAt DateTime  @default(now())
+}
+
+model FieldDispatch {
+  id            Int          @id @default(autoincrement())
+  date          DateTime
+  waiter        Employee     @relation(fields: [waiterId], references: [id])
+  waiterId      Int
+  item          MenuItem     @relation(fields: [itemId], references: [id])
+  itemId        Int
+  qtyDispatched Decimal      @db.Decimal(10, 2)
+  priceEach     Decimal      @db.Decimal(10, 2)
+  createdAt     DateTime     @default(now())
+  return        FieldReturn?
+}
+
+model FieldReturn {
+  id            Int           @id @default(autoincrement())
+  dispatch      FieldDispatch @relation(fields: [dispatchId], references: [id])
+  dispatchId    Int           @unique
+  qtyReturned   Decimal       @db.Decimal(10, 2)
+  lossQty       Decimal       @default(0) @db.Decimal(10, 2)
+  cashCollected Decimal       @db.Decimal(10, 2)
+  note          String?
+  createdAt     DateTime      @default(now())
+}
+
+model Advance {
+  id         Int      @id @default(autoincrement())
+  date       DateTime
+  employee   Employee @relation(fields: [employeeId], references: [id])
+  employeeId Int
+  amount     Decimal  @db.Decimal(10, 2)
+  note       String?
+}
+
+model Deduction {
+  id         Int      @id @default(autoincrement())
+  date       DateTime
+  employee   Employee @relation(fields: [employeeId], references: [id])
+  employeeId Int
+  amount     Decimal  @db.Decimal(10, 2)
+  reason     String
+}
+
+model EmployeeSalaryMeta {
+  employee    Employee @relation(fields: [employeeId], references: [id])
+  employeeId  Int      @id
+  baseMonthly Decimal  @default(0) @db.Decimal(10, 2)
+}
+
+model SalaryRun {
+  id        Int      @id @default(autoincrement())
+  month     String
+  createdAt DateTime @default(now())
+  payouts   Payout[]
+}
+
+model Payout {
+  id              Int       @id @default(autoincrement())
+  salaryRun       SalaryRun @relation(fields: [salaryRunId], references: [id])
+  salaryRunId     Int
+  employee        Employee  @relation(fields: [employeeId], references: [id])
+  employeeId      Int
+  baseSalary      Decimal   @db.Decimal(10, 2)
+  advancesTotal   Decimal   @db.Decimal(10, 2)
+  deductionsTotal Decimal   @db.Decimal(10, 2)
+  netPay          Decimal   @db.Decimal(10, 2)
+}

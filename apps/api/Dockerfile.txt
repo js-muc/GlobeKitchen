@@ -1,0 +1,21 @@
+FROM node:20-bullseye
+
+WORKDIR /app
+
+RUN corepack enable && corepack prepare pnpm@9.9.0 --activate
+
+# Copy lockfiles & tsconfig first for better caching
+COPY package.json pnpm-lock.yaml tsconfig.json ./
+COPY prisma ./prisma
+
+RUN pnpm install --frozen-lockfile
+RUN npx prisma generate
+
+# Then the rest of the source
+COPY src ./src
+
+ENV NODE_ENV=development
+ENV PORT=4000
+
+EXPOSE 4000
+CMD ["pnpm", "dev"]

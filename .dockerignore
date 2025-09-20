@@ -1,0 +1,14 @@
+﻿# keep the context small and avoid hiding src/prisma
+node_modules
+.git
+dist
+build
+coverage
+.env
+**/.env
+**/.turbo
+**/tmp
+**/.next
+**/.cache
+Dockerfile
+docker-compose*.yml

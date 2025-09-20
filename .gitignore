@@ -1,0 +1,17 @@
+node_modules
+.pnpm-store
+dist
+.env
+.env.local
+data/
+.DS_Store
+Thumbs.db
+
+# node
+node_modules/
+.pnpm-store/
+dist/
+build/
+*.log
+.env*
+
