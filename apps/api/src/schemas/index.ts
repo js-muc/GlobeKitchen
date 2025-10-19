@@ -2,13 +2,23 @@ import { z } from "zod";
 
 export const ZTableCode = z.enum(["A6", "A7", "A8", "A9"]);
 export const ZMovementDirection = z.enum(["IN", "OUT"]);
-export const ZEmployeeRole = z.enum(["KITCHEN", "WAITER"]);
+export const ZEmployeeRole = z.enum([
+  "WAITER",
+  "CHEF",
+  "CASHIER",
+  "MANAGER",
+  "KITCHEN",
+]);
 export const ZEmployeeType = z.enum(["INSIDE", "FIELD", "KITCHEN"]);
 
 // Accept either strict RFC3339 string OR any parseable date (coerced)
 const ZIsoOrDate = z.union([z.string().datetime(), z.coerce.date()]);
 
-// Items
+// Accept "35000.00" or 35000 (routes normalize to 2dp string)
+const ZMoneyString = z.string().regex(/^\d+(\.\d{2})?$/);
+const ZMoneyInput = z.union([ZMoneyString, z.number().finite().nonnegative()]).optional();
+
+/* ------------------------- Items ------------------------- */
 export const zItemCreate = z.object({
   name: z.string().min(1, "name required"),
   priceSell: z.number().nonnegative(),
@@ -17,6 +27,7 @@ export const zItemCreate = z.object({
   costUnit: z.number().nonnegative().nullable().optional(),
   active: z.boolean().optional(),
 });
+
 export const zItemUpdate = z.object({
   name: z.string().min(1).optional(),
   priceSell: z.number().nonnegative().optional(),
@@ -26,18 +37,20 @@ export const zItemUpdate = z.object({
   active: z.boolean().optional(),
 });
 
-// Employees
+/* ----------------------- Employees ----------------------- */
 export const zEmployeeCreate = z.object({
   name: z.string().min(1, "name required"),
   role: ZEmployeeRole.default("WAITER"),
   type: ZEmployeeType.default("INSIDE"),
   tableCode: ZTableCode.nullable().optional(),
   phone: z.string().nullable().optional(),
+  salaryMonthly: ZMoneyInput,            // ✅ NEW
   active: z.boolean().optional(),
 });
+
 export const zEmployeeUpdate = zEmployeeCreate.partial();
 
-// Stock Movement
+/* -------------------- Stock Movements -------------------- */
 export const zStockMovementCreate = z.object({
   itemId: z.number().int().positive(),
   direction: ZMovementDirection,
@@ -46,10 +59,9 @@ export const zStockMovementCreate = z.object({
   note: z.string().max(200).nullable().optional(),
 });
 
-// Table Sale
+/* ----------------------- Table Sales --------------------- */
 export const zTableSaleCreate = z.object({
-  // was: z.string().datetime().optional()
-  date: ZIsoOrDate.optional(), // ISO string or parseable Date
+  date: ZIsoOrDate.optional(),
   waiterId: z.number().int().positive(),
   tableCode: ZTableCode,
   itemId: z.number().int().positive(),
@@ -60,20 +72,20 @@ export const zTableSaleCreate = z.object({
   note: z.string().max(200).nullable().optional(),
 });
 
-// Field Dispatch
+/* --------------------- Field Dispatch -------------------- */
 export const zFieldDispatchCreate = z.object({
-  // was: z.string().datetime().optional()
-  date: ZIsoOrDate.optional(), // ISO string or parseable Date
+  date: ZIsoOrDate.optional(),
   waiterId: z.number().int().positive(),
   itemId: z.number().int().positive(),
   qtyDispatched: z.number().positive(),
   priceEach: z.number().nonnegative(),
 });
 
-// Field Return
+/* ---------------------- Field Return --------------------- */
 export const zFieldReturnCreate = z.object({
   dispatchId: z.number().int().positive(),
   qtyReturned: z.number().nonnegative(),
   cashCollected: z.number().nonnegative().default(0),
+  lossQty: z.number().int().nonnegative().default(0),
   note: z.string().max(200).nullable().optional(),
 });

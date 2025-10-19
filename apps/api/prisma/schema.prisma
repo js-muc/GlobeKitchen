@@ -10,8 +10,11 @@ datasource db {
 
 // =================== Enums ===================
 enum EmployeeRole {
-  KITCHEN
   WAITER
+  CHEF
+  CASHIER
+  MANAGER
+  KITCHEN
 }
 
 enum EmployeeType {
@@ -32,6 +35,14 @@ enum MovementDirection {
   OUT
 }
 
+// --- NEW: unified deduction reasons ---
+enum DeductionReason {
+  ADVANCE   // salary advance
+  BREAKAGE  // waiter broke an item
+  LOSS      // operational loss attributable to waiter
+  OTHER
+}
+
 // =================== Models ===================
 model User {
   id        Int      @id @default(autoincrement())
@@ -49,12 +60,20 @@ model Employee {
   phone           String?
   active          Boolean             @default(true)
   createdAt       DateTime            @default(now())
-  salary          EmployeeSalaryMeta?
-  advances        Advance[]
-  deductions      Deduction[]
+
+  // --- NEW: monthly salary used by payroll runs ---
+  salaryMonthly   Decimal             @default(0) @db.Decimal(10, 2)
+
+  // --- UPDATED relations: unified ledger + payroll lines ---
+  deductions      SalaryDeduction[]
+  payrollLines    PayrollLine[]
+
+  // existing relations (unchanged)
   tableSales      TableSale[]
   fieldDispatches FieldDispatch[]
-  Payout          Payout[]
+
+  // daily sales shifts (explicit backref)
+  shifts          Shift[]
 }
 
 model MenuItem {
@@ -71,6 +90,9 @@ model MenuItem {
   convTo         Conversion[]    @relation("to")
   TableSale      TableSale[]
   FieldDispatch  FieldDispatch[]
+  // daily sales lines / adjustments (explicit backrefs)
+  saleLines      SaleLine[]
+  stockAdjs      StockAdj[]
 }
 
 model Conversion {
@@ -84,6 +106,7 @@ model Conversion {
 
 model StockMovement {
   id        Int               @id @default(autoincrement())
+  item      MenuItem          @relation(fields: [itemId], references: [id])
   itemId    Int
   direction MovementDirection
   quantity  Int
@@ -95,7 +118,6 @@ model StockMovement {
   @@index([direction])
   @@index([createdAt])
 }
-
 
 model TableSale {
   id        Int       @id @default(autoincrement())
@@ -137,45 +159,160 @@ model FieldReturn {
   createdAt     DateTime      @default(now())
 }
 
-model Advance {
-  id         Int      @id @default(autoincrement())
-  date       DateTime
-  employee   Employee @relation(fields: [employeeId], references: [id])
-  employeeId Int
-  amount     Decimal  @db.Decimal(10, 2)
-  note       String?
-}
+// =================== NEW UNIFIED LEDGER + PAYROLL ===================
 
-model Deduction {
-  id         Int      @id @default(autoincrement())
-  date       DateTime
-  employee   Employee @relation(fields: [employeeId], references: [id])
-  employeeId Int
-  amount     Decimal  @db.Decimal(10, 2)
-  reason     String
-}
-
-model EmployeeSalaryMeta {
-  employee    Employee @relation(fields: [employeeId], references: [id])
-  employeeId  Int      @id
-  baseMonthly Decimal  @default(0) @db.Decimal(10, 2)
-}
-
-model SalaryRun {
-  id        Int      @id @default(autoincrement())
-  month     String
-  createdAt DateTime @default(now())
-  payouts   Payout[]
-}
-
-model Payout {
-  id              Int       @id @default(autoincrement())
-  salaryRun       SalaryRun @relation(fields: [salaryRunId], references: [id])
-  salaryRunId     Int
-  employee        Employee  @relation(fields: [employeeId], references: [id])
+model SalaryDeduction {
+  id              Int             @id @default(autoincrement())
   employeeId      Int
-  baseSalary      Decimal   @db.Decimal(10, 2)
-  advancesTotal   Decimal   @db.Decimal(10, 2)
-  deductionsTotal Decimal   @db.Decimal(10, 2)
-  netPay          Decimal   @db.Decimal(10, 2)
+  date            DateTime        @default(now())
+  amount          Decimal         @db.Decimal(10, 2) // > 0
+  reason          DeductionReason
+  note            String?
+  meta            Json?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  createdByUserId Int?
+
+  employee        Employee        @relation(fields: [employeeId], references: [id])
+
+  @@index([employeeId, date])
+  @@index([reason, date])
+}
+
+model PayrollRun {
+  id              Int          @id @default(autoincrement())
+  periodYear      Int
+  periodMonth     Int
+  runAt           DateTime     @default(now())
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  createdByUserId Int?
+
+  lines           PayrollLine[]
+
+  @@unique([periodYear, periodMonth], name: "unique_period")
+}
+
+model PayrollLine {
+  id                 Int         @id @default(autoincrement())
+  payrollRunId       Int
+  employeeId         Int
+
+  gross              Decimal     @db.Decimal(10, 2) // snapshot of salaryMonthly
+  deductionsApplied  Decimal     @db.Decimal(10, 2) // <= gross
+  carryForward       Decimal     @db.Decimal(10, 2) // >= 0
+  netPay             Decimal     @db.Decimal(10, 2) // gross - deductionsApplied
+
+  note               String?
+  createdAt          DateTime    @default(now())
+
+  payrollRun         PayrollRun  @relation(fields: [payrollRunId], references: [id], onDelete: Cascade)
+  employee           Employee    @relation(fields: [employeeId], references: [id])
+
+  @@index([payrollRunId])
+  @@index([employeeId])
+}
+
+// --- Daily Sales -------------------------------------------------------------
+
+enum WaiterType {
+  INSIDE
+  FIELD
+}
+
+enum StockAdjKind {
+  TAKE     // items given to field waiter
+  ADD      // extra items added later for field waiter
+  RETURN   // items returned unsold by field waiter
+}
+
+model Shift {
+  id            Int         @id @default(autoincrement())
+  date          DateTime    @db.Date
+  employeeId    Int
+  waiterType    WaiterType
+  openedAt      DateTime
+  closedAt      DateTime?
+  openingFloat  Decimal?    @db.Decimal(12, 2)
+  notes         String?
+
+  // inside only
+  tableCode     String?
+
+  // field only (optional meta)
+  route         String?
+
+  // denormalized money summary for fast queries
+  grossSales    Decimal      @default(0) @db.Decimal(12, 2)
+  discounts     Decimal      @default(0) @db.Decimal(12, 2)
+  returnsValue  Decimal      @default(0) @db.Decimal(12, 2)
+  netSales      Decimal      @default(0) @db.Decimal(12, 2)
+  cashRemit     Decimal      @default(0) @db.Decimal(12, 2)
+
+  // relations
+  employee      Employee     @relation(fields: [employeeId], references: [id])
+  lines         SaleLine[]
+  adjustments   StockAdj[]
+
+  // NEW: back-reference to cash-up snapshot (one-per-shift design)
+  cashup        ShiftCashup?
+
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  @@index([date, employeeId])
+  @@index([date, waiterType])
+}
+
+model SaleLine {
+  id          Int       @id @default(autoincrement())
+  shiftId     Int
+  date        DateTime  @db.Date
+  itemId      Int
+  qty         Decimal   @db.Decimal(12, 2)
+  unit        String
+  unitPrice   Decimal   @db.Decimal(12, 2)
+  total       Decimal   @db.Decimal(12, 2) // qty * unitPrice snapshot
+  tableCode   String?
+  note        String?
+  createdAt   DateTime  @default(now())
+
+  shift       Shift     @relation(fields: [shiftId], references: [id])
+  item        MenuItem  @relation(fields: [itemId], references: [id])
+
+  @@index([shiftId, date])
+  @@index([itemId])
+}
+
+model StockAdj {
+  id          Int           @id @default(autoincrement())
+  shiftId     Int
+  date        DateTime      @db.Date
+  itemId      Int
+  kind        StockAdjKind
+  qty         Decimal       @db.Decimal(12, 2)
+  unit        String
+  unitCost    Decimal?      @db.Decimal(12, 2)
+  note        String?
+  createdAt   DateTime      @default(now())
+
+  shift       Shift         @relation(fields: [shiftId], references: [id])
+  item        MenuItem      @relation(fields: [itemId], references: [id])
+
+  @@index([shiftId, date])
+  @@index([itemId])
+}
+
+// ------------------- NEW: Cash-up snapshots -------------------
+model ShiftCashup {
+  id          Int      @id @default(autoincrement())
+  shiftId     Int      @unique
+  snapshot    Json
+  note        String?  @db.Text
+  submittedBy String?
+  createdAt   DateTime @default(now())
+
+  shift       Shift    @relation(fields: [shiftId], references: [id])
+
+  @@index([createdAt])
 }
