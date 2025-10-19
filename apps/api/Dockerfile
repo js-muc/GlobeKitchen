@@ -1,34 +1,35 @@
-﻿# apps/api/Dockerfile
+﻿# apps/api/Dockerfile — production build
 FROM node:20-bullseye
 
-# 1) Base workspace
 WORKDIR /app
 
-# Use pnpm via corepack
-RUN corepack enable && corepack prepare pnpm@9.9.0 --activate
+# pnpm
+RUN corepack enable && corepack prepare pnpm@10.17.0 --activate
 
-# 2) Copy only manifests first for better layer caching
+# 1) workspace manifests
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml* ./
 COPY apps/api/package.json ./apps/api/package.json
 
-# 3) Install ONLY what's needed for apps/api (respects workspaces)
+# 2) install only API deps
 RUN pnpm -w install --frozen-lockfile --filter ./apps/api...
 
-# 4) Copy prisma + tsconfig for generate step
-COPY apps/api/tsconfig.json ./apps/api/tsconfig.json
+# 3) prisma + tsconfigs
 COPY apps/api/prisma ./apps/api/prisma
+COPY apps/api/tsconfig.json ./apps/api/tsconfig.json
+COPY apps/api/tsconfig.build.json ./apps/api/tsconfig.build.json
 
-# 5) Generate Prisma client (safe to no-op if schema missing)
-RUN pnpm --filter ./apps/api... exec prisma generate || echo "no prisma schema, skipping generate"
+# 4) *** generate prisma client (REQUIRED before tsc) ***
+RUN pnpm --filter ./apps/api... exec prisma generate --schema=/app/apps/api/prisma/schema.prisma || echo "no prisma schema, skipping generate"
 
-# 6) Copy the rest of the app source
+# 5) source
 COPY apps/api/src ./apps/api/src
 
-# 7) Runtime config
+# 6) build TS -> dist
 WORKDIR /app/apps/api
-ENV NODE_ENV=development
+RUN pnpm run build
+
+# 7) runtime
+ENV NODE_ENV=production
 ENV PORT=4000
 EXPOSE 4000
-
-# 8) Start dev server (use "pnpm start" for prod build)
-CMD ["pnpm", "dev"]
+CMD ["node", "dist/index.js"]
