@@ -1,6 +1,9 @@
-﻿services:
+﻿name: globekitchen  # avoid the symlink-based auto-name warning
+
+services:
   db:
     image: postgres:16
+    container_name: globekitchen-db
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -9,17 +12,65 @@
       - pgdata:/var/lib/postgresql/data
     ports:
       - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d globekitchen"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   api:
     build:
       context: .
       dockerfile: apps/api/Dockerfile
+    container_name: globekitchen-api
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/globekitchen?schema=public
+      JWT_SECRET: super-long-random-string
+      # Allow both Next (3000) and Vite (5173) during dev
+      CORS_ORIGIN: http://localhost:3000,http://localhost:5173
+      ADMIN_EMAIL: admin@example.com
+
+      # ✅ Prisma: force binary engines to avoid JS/engine mismatch panics
+      PRISMA_CLIENT_ENGINE_TYPE: binary
+      PRISMA_CLI_QUERY_ENGINE_TYPE: binary
+
+      # 👇 helps file watching on Windows (tsx/chokidar)
+      CHOKIDAR_USEPOLLING: "true"
+      CHOKIDAR_INTERVAL: "300"
+    depends_on:
+      db:
+        condition: service_healthy
     ports:
       - "4000:4000"
-    env_file:
-      - apps/api/.env
-    depends_on:
-      - db
+      - "4100:4000"   # keep secondary mapping for FE calls to http://127.0.0.1:4100
+    # Bind-mount only source & prisma for live dev; keep node_modules inside container via named volumes
+    volumes:
+      # live-reload code & schema
+      - ./apps/api/src:/app/apps/api/src
+      - ./apps/api/prisma:/app/apps/api/prisma
+      # ensure the container uses the updated dev script without rebuilds
+      - ./apps/api/package.json:/app/apps/api/package.json:ro
+      # keep container's installs intact
+      - root_node_modules:/app/node_modules
+      - api_node_modules:/app/apps/api/node_modules
+      # (optional) share dotenv if you want live edits
+      # - ./apps/api/.env:/app/apps/api/.env:ro
+    working_dir: /app
+    # ✅ Always (re)generate Prisma client first, then run dev
+    command: >
+      sh -lc "pnpm -C apps/api exec prisma generate &&
+              pnpm -C apps/api dev"
+    restart: unless-stopped
+    healthcheck:
+      # Use /api/health (matches your server logs) and give the dev server time to boot
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:4000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s   # ⬅︎ extra grace so 'tsx watch' can compile before first probe
 
 volumes:
   pgdata:
+  root_node_modules:
+  api_node_modules:
