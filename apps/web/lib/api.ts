@@ -154,7 +154,7 @@ export type EmployeesResponse = {
 export type CreateEmployeeInput = {
   name: string;
   role: string; // e.g. "CHEF" | "WAITER" | "CASHIER" | "MANAGER"
-  type: "INSIDE" | "FIELD" | "KITCHEN"; // ✅ fixed
+  type: "INSIDE" | "FIELD" | "KITCHEN";
   tableCode?: string | null;
   phone?: string | null;
   salaryMonthly: number;
@@ -212,4 +212,4 @@ export async function deleteEmployee(id: string | number) {
   }
 }
 
-/* …(rest of the file unchanged)… */
+/* …rest of original file unchanged… */

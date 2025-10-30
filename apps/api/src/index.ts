@@ -8,7 +8,7 @@ import morgan from "morgan";
 
 import routes from "./routes/index.js";
 import dailySalesRouter from "./routes/dailySales.js";
-// NEW: direct shifts router alias under /api/daily-sales
+// NEW (kept): direct shifts router alias under /api/daily-sales
 import shiftsRouter from "./routes/shifts.js";
 
 // ✅ Swagger/OpenAPI — use namespace import for wide compat
@@ -61,7 +61,9 @@ const corsOptions: CorsOptions = {
     if (!origin) return cb(null, true);
     if (allowlist.includes(origin)) return cb(null, true);
     // Helpful log during setup
-    console.warn(`[CORS] blocked origin: ${origin} (allowed: ${allowlist.join(", ")})`);
+    console.warn(
+      `[CORS] blocked origin: ${origin} (allowed: ${allowlist.join(", ")})`
+    );
     return cb(new Error("CORS: origin not allowed"));
   },
   // Make preflight explicit and compatible with axios/fetch defaults
@@ -138,7 +140,7 @@ app.use(
    Application routes
 ========================= */
 // This mounts everything from apps/api/src/routes/index.ts,
-// including /api/shifts after your previous update.
+// including /api/shifts after your previous update (and /api/stock from our new routes).
 app.use("/api", routes);
 
 /* =========================
@@ -170,7 +172,9 @@ app.use(
         detail:
           process.env.NODE_ENV === "production"
             ? undefined
-            : `Origin not allowed by server CORS. Allowed: ${allowlist.join(", ")}`,
+            : `Origin not allowed by server CORS. Allowed: ${allowlist.join(
+                ", "
+              )}`,
       });
     }
     return res.status(500).json({
@@ -210,5 +214,17 @@ if (process.env.NODE_ENV !== "test") {
       console.error("❌ Server error:", err?.message || err);
     }
     process.exit(1);
+  });
+
+  // (Non-breaking) extra safety: surface unhandled rejections in dev
+  process.on("unhandledRejection", (reason: any) => {
+    if (process.env.NODE_ENV !== "production") {
+      console.error("⚠️  UnhandledRejection:", reason?.message || reason);
+    }
+  });
+  process.on("uncaughtException", (err: any) => {
+    if (process.env.NODE_ENV !== "production") {
+      console.error("⚠️  UncaughtException:", err?.message || err);
+    }
   });
 }

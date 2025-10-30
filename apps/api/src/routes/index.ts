@@ -19,6 +19,9 @@ import payroll from "./payroll.js";
 // NEW: shifts (daily sales shift open/close/cashup)
 import shifts from "./shifts.js";
 
+// NEW: Stock management (purchases/usage/adjustments)
+import stock from "./stock.js";
+
 import { requireAdmin } from "../middlewares/auth.js";
 
 const r = Router({ mergeParams: true });
@@ -37,6 +40,7 @@ const MOUNTS: string[] = [
   "/payroll",
 
   // NEW
+  "/stock",
   "/shifts",
   "/daily-sales/shifts",
   "/daily-sales/shifts/for-employee", // legacy compat
@@ -71,6 +75,9 @@ r.use("/field-return", requireAdmin, fieldReturn);
 // NEW: Payroll & Deductions (admin-protected)
 r.use("/salary-deductions", requireAdmin, salaryDeductions);
 r.use("/payroll", requireAdmin, payroll);
+
+// NEW: Stock management (admin-protected)
+r.use("/stock", requireAdmin, stock);
 
 // NEW: Shifts (admin-protected; alias kept for daily-sales namespace)
 r.use("/shifts", requireAdmin, shifts);

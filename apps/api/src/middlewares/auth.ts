@@ -23,6 +23,34 @@ export interface RequestWithAdmin extends Request {
 
 const TOKEN_COOKIE = "token";
 
+/** ---------- BYPASS helpers (LOCAL TEST ONLY) ---------- */
+function isBypassEnabled(): boolean {
+  // Prefer ENV.BYPASS_AUTH if your config exposes it; fall back to process.env
+  const v = (ENV as any).BYPASS_AUTH ?? process.env.BYPASS_AUTH;
+  return String(v) === "1";
+}
+
+/** A safe, minimal fake admin to attach during bypass */
+function fakeAdmin(): AdminClaims {
+  const email =
+    ENV.ADMIN_EMAIL ??
+    "bypass-admin@example.local";
+  return {
+    sub: 0,
+    email,
+    role: "ADMIN",
+    isAdmin: true,
+  };
+}
+
+function attachUser(req: RequestWithAdmin, res: Response, claims: AdminClaims) {
+  req.user = claims;
+  req.admin = claims; // back-compat
+  (res.locals as any).user = claims;
+  (res.locals as any).admin = claims;
+}
+
+/** ---------- token helpers (unchanged) ---------- */
 /** Safely extract a bearer token from an Authorization header */
 function extractBearerToken(headerValue?: string): string | null {
   if (!headerValue) return null;
@@ -105,19 +133,22 @@ function isAdminUser(claims: AdminClaims): boolean {
  * requireAuth
  * - Verifies JWT (header or cookie)
  * - Attaches claims to req.user and req.admin (back-compat)
+ * - BYPASS: if BYPASS_AUTH=1, auto-attach a fake admin
  */
 export function requireAuth(req: RequestWithAdmin, res: Response, next: NextFunction) {
   try {
+    if (isBypassEnabled()) {
+      attachUser(req, res, fakeAdmin());
+      return next();
+    }
+
     const token = getTokenFromRequest(req);
     if (!token) return res.status(401).json({ error: "unauthorized" });
 
     const claims = verifyToken(token);
 
     // Attach for downstream use
-    req.user = claims;
-    req.admin = claims;               // keep for existing code paths
-    (res.locals as any).user = claims;
-    (res.locals as any).admin = claims;
+    attachUser(req, res, claims);
 
     return next();
   } catch (err: any) {
@@ -138,18 +169,21 @@ export function requireAuth(req: RequestWithAdmin, res: Response, next: NextFunc
  * - Admin if:
  *    • JWT has role "ADMIN" OR isAdmin === true
  *    • OR email matches ENV.ADMIN_EMAIL
+ * - BYPASS: if BYPASS_AUTH=1, auto-attach a fake admin
  */
 export function requireAdmin(req: RequestWithAdmin, res: Response, next: NextFunction) {
   try {
+    if (isBypassEnabled()) {
+      attachUser(req, res, fakeAdmin());
+      return next();
+    }
+
     // If a previous middleware didn't load the user, do it now for convenience
     if (!req.user) {
       const token = getTokenFromRequest(req);
       if (!token) return res.status(401).json({ error: "unauthorized" });
       const claims = verifyToken(token);
-      req.user = claims;
-      req.admin = claims;
-      (res.locals as any).user = claims;
-      (res.locals as any).admin = claims;
+      attachUser(req, res, claims);
     }
 
     if (!req.user) return res.status(401).json({ error: "unauthorized" });

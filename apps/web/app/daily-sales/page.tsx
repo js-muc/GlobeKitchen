@@ -1,22 +1,14 @@
-// LABEL: PAGE_DAILY_SALES_V10
+// C:\GlobeKitchen\apps\web\app\daily-sales\page.tsx
+// LABEL: PAGE_DAILY_SALES_V17 (patched)
 "use client";
 
 import React from "react";
 import DashboardShell from "@/components/layout/DashboardShell";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  // keep original APIs available (fallbacks)
-  createOrGetShift as apiCreateOrGetShiftMaybe,
-  addShiftLine,
-  getShiftSummary,
-  // ts-expect-error: may or may not exist; we fall back to REST
-  closeShift as apiCloseShiftMaybe,
-  createCashup,
-  type Shift,
-  // NEW (already present in your api.sales.ts)
-  listShifts,
-  listCashups,
-} from "@/lib/api.sales";
+
+// Namespace import to avoid TS named-export issues and allow runtime resolution.
+import * as SalesApi from "@/lib/api.sales";
+
 import {
   Search,
   Save,
@@ -28,6 +20,7 @@ import {
   Trash2,
   User2,
 } from "lucide-react";
+
 import { useEmployeesLite } from "@/lib/hooks/useEmployeesLite";
 import { useMenuItemsSearch, type ItemLite } from "@/lib/hooks/useMenuItemsSearch";
 import { api } from "@/lib/api";
@@ -36,7 +29,11 @@ import { api } from "@/lib/api";
 const toNum = (v: unknown) =>
   typeof v === "number" ? (Number.isFinite(v) ? v : 0) : Number(v ?? 0) || 0;
 const fmtMoney = (v: unknown) => toNum(v).toFixed(2);
-const todayStr = () => new Date().toISOString().slice(0, 10);
+// IMPORTANT: use local date like API_SALES_V10 does
+const todayStr = () => new Date().toLocaleDateString("en-CA"); // YYYY-MM-DD (local)
+
+/* ===== Types (from SalesApi) ===== */
+type Shift = SalesApi.Shift;
 
 /* ===== Summary types (defensive) ===== */
 type SummaryRow = {
@@ -67,9 +64,11 @@ function useItemsCatalog() {
         name: it.name ?? it.title ?? `Item #${it.id}`,
         unit: it.unit ?? it.defaultUnit ?? "",
         priceSell:
-          typeof it.price === "number"
-            ? it.price
-            : Number(it.price ?? it.defaultPrice ?? 0),
+          typeof it?.priceSell === "number"
+            ? it.priceSell
+            : it?.priceSell != null
+            ? Number(it.priceSell)
+            : 0,
       }));
     },
     staleTime: 5 * 60 * 1000,
@@ -88,86 +87,25 @@ function fuzzyPick<T extends { name?: string | null; id: number }>(list: T[], qu
   return contains ?? null;
 }
 
-/* ===== Correct BE helpers: get-or-open shift by employeeId ===== */
-async function getCurrentShift(employeeId: number) {
-  // FIX: route must be under /daily-sales/shifts/current
-  const res = await api.get("/daily-sales/shifts/current", { params: { employeeId } });
-  return res.data?.shift ?? res.data;
-}
-async function openShiftREST(params: {
-  employeeId: number;
-  waiterType: "INSIDE" | "FIELD";
-  tableCode?: string;
-}) {
-  const body: any = {
-    date: todayStr(),
-    employeeId: params.employeeId,
-    waiterType: params.waiterType,
-  };
-  if (params.waiterType === "INSIDE" && params.tableCode) {
-    body.tableCode = params.tableCode;
-  }
-  const res = await api.post("/daily-sales/shifts/open", body);
-  return res.data?.shift ?? res.data;
-}
-async function getOrOpenShift(
-  employeeId: number,
-  waiterType: "INSIDE" | "FIELD",
-  tableCode?: string
-) {
-  if (typeof apiCreateOrGetShiftMaybe === "function") {
-    // @ts-ignore – optional service
-    return apiCreateOrGetShiftMaybe({ employeeId, waiterType, tableCode });
-  }
-  // 1) try current
-  try {
-    const cur = await getCurrentShift(employeeId);
-    if (cur?.id) return cur;
-  } catch (e: any) {
-    const status = e?.response?.status ?? e?.status;
-    if (status && status !== 404) throw e;
-  }
-  // 2) open new
-  return openShiftREST({ employeeId, waiterType, tableCode });
-}
+/* ===== Add-line resolver: supports addSaleLine and legacy addShiftLine ===== */
+type AddLineFn = (args: {
+  shiftId: number;
+  itemId: number;
+  qty: number;
+  unitPrice: number;
+  unit?: string;
+  type?: string;
+  note?: string;
+}) => Promise<{ ok: boolean; line: any; shift?: any }>;
 
-/* ===== Optional helpers added for cashier/day-end (404-tolerant) ===== */
-async function getDailyRollup(date: string): Promise<ShiftSummary | null> {
-  try {
-    const res = await api.get("/daily-sales/summary/daily", { params: { date } });
-    return res.data as ShiftSummary;
-  } catch (e: any) {
-    const status = e?.response?.status ?? e?.status;
-    if (status === 404) return null; // route not present yet
-    throw e;
-  }
-}
-
-type CashupSnap =
-  | { snapshot: any; note?: string | null; submittedBy?: string | null }
-  | { snapshots: Array<{ at: string; payload: any }> };
-
-async function getCashupSnapshot(shiftId: number): Promise<CashupSnap | null> {
-  try {
-    const res = await api.get(`/daily-sales/shifts/${shiftId}/cashup`);
-    return res.data as CashupSnap;
-  } catch (e: any) {
-    const status = e?.response?.status ?? e?.status;
-    if (status === 404) return null;
-    throw e;
-  }
-}
-
-/* ===== Lightweight employee-name cache for chips/rollups ===== */
-async function fetchEmployeeName(id: number): Promise<string> {
-  try {
-    const res = await api.get(`/employees/${id}`);
-    const row = res.data?.data ?? res.data;
-    return row?.name ?? `#${id}`;
-  } catch {
-    return `#${id}`;
-  }
-}
+const addLine: AddLineFn = async (args) => {
+  const fn =
+    (SalesApi as any).addSaleLine ??
+    (SalesApi as any).addShiftLine; // both exist in API_SALES_V10
+  if (typeof fn !== "function") throw new Error("Sales API add-line function not found.");
+  const res = await fn(args);
+  return res as { ok: boolean; line: any; shift?: any };
+};
 
 export default function DailySalesPage() {
   const qc = useQueryClient();
@@ -176,13 +114,13 @@ export default function DailySalesPage() {
   const [employeeId, setEmployeeId] = React.useState<number>(0);
   const [employeeQuery, setEmployeeQuery] = React.useState<string>("");
   const [waiterType, setWaiterType] = React.useState<"INSIDE" | "FIELD">("INSIDE");
-  const [shift, setShift] = React.useState<Shift | null>(null);
+  const [shift, setShift] = React.useState<Shift | (Shift & { closedAt?: string | null }) | null>(null);
 
   const [itemId, setItemId] = React.useState<number>(0);
   const [itemQuery, setItemQuery] = React.useState<string>("");
   const [qty, setQty] = React.useState<number>(1);
   const [unitPrice, setUnitPrice] = React.useState<number>(0);
-  const [unit, setUnit] = React.useState<string>("plate");
+  const [unit, setUnit] = React.useState<string>("unit"); // default 'unit'
   const [tableCode, setTableCode] = React.useState<string>("");
 
   const [showDaily, setShowDaily] = React.useState<boolean>(false);
@@ -204,22 +142,31 @@ export default function DailySalesPage() {
   const { data: todaysShifts } = useQuery({
     queryKey: ["daily-sales", "shifts", todayStr()],
     queryFn: () =>
-      listShifts({ dateFrom: todayStr(), dateTo: todayStr(), page: 1, limit: 200 }),
+      SalesApi.listShifts({ dateFrom: todayStr(), dateTo: todayStr(), page: 1, limit: 200 }),
     staleTime: 30_000,
   });
 
-  // Daily rollup (on demand, 404 tolerant)
+  // Daily rollup (on demand, aligned to API_SALES_V10 getDailyRollup)
   const qDaily = useQuery<ShiftSummary | null>({
     enabled: showDaily,
     queryKey: ["daily-sales", "summary", "daily", todayStr()],
-    queryFn: () => getDailyRollup(todayStr()),
+    queryFn: async () => {
+      try {
+        const r = await SalesApi.getDailyRollup(todayStr());
+        return r as unknown as ShiftSummary;
+      } catch (e: any) {
+        // 404 tolerant in case BE doesn’t have it
+        if ((e && (e.status || (e as any).status)) === 404) return null;
+        throw e;
+      }
+    },
   });
 
-  // Cash-up snapshot viewer (on demand, 404 tolerant)
-  const qCashup = useQuery<CashupSnap | null>({
+  // Cash-up snapshot viewer (on demand)
+  const qCashup = useQuery<any>({
     enabled: showCashup && !!shift?.id,
     queryKey: ["daily-sales", "cashup", shift?.id],
-    queryFn: () => getCashupSnapshot(shift!.id),
+    queryFn: () => SalesApi.getShiftCashup(shift!.id),
   });
 
   /* ---------- Name resolution strategy ---------- */
@@ -251,11 +198,25 @@ export default function DailySalesPage() {
   const [empNameById, setEmpNameById] = React.useState<Map<number, string>>(() => new Map());
   React.useEffect(() => {
     (async () => {
-      const ids =
-        todaysShifts?.data?.map((s: any) => Number(s.employeeId)).filter(Boolean) ?? [];
-      const unique = Array.from(new Set(ids)).filter((id) => !empNameById.has(id));
-      if (!unique.length) return;
-      const results = await Promise.all(unique.map((id) => fetchEmployeeName(id)));
+      const ids: number[] =
+        (todaysShifts?.data?.map((s: any) => Number(s.employeeId)) ?? []).filter(
+          (n: number) => Number.isFinite(n) && n > 0
+        );
+      const unique: number[] = Array.from(new Set<number>(ids)).filter(
+        (id: number) => !empNameById.has(id)
+      );
+      if (unique.length === 0) return;
+      const results = await Promise.all(
+        unique.map(async (id: number) => {
+          try {
+            const res = await api.get(`/employees/${id}`);
+            const row = res.data?.data ?? res.data;
+            return row?.name ?? `#${id}`;
+          } catch {
+            return `#${id}`;
+          }
+        })
+      );
       setEmpNameById((prev) => {
         const next = new Map(prev);
         for (let i = 0; i < unique.length; i++) next.set(unique[i], results[i]);
@@ -270,17 +231,17 @@ export default function DailySalesPage() {
   );
   React.useEffect(() => {
     (async () => {
-      const list = todaysShifts?.data ?? [];
-      const missing = list
-        .map((s: any) => s.id)
-        .filter((id: number) => !shiftTotalById.has(id));
+      const list: any[] = todaysShifts?.data ?? [];
+      const missing: number[] = list
+        .map((s: any) => Number(s.id))
+        .filter((id: number) => Number.isFinite(id) && id > 0 && !shiftTotalById.has(id));
       if (!missing.length) return;
 
       const fetched = await Promise.all(
         missing.map(async (id: number) => {
           try {
-            const s = await getShiftSummary(id);
-            return { id, total: Number(s?.totals?.cashDue || 0) };
+            const s = await SalesApi.getShiftSummary(id);
+            return { id, total: Number((s as any)?.totals?.cashDue || 0) };
           } catch {
             return { id, total: 0 };
           }
@@ -297,15 +258,39 @@ export default function DailySalesPage() {
   const totalsByEmployee = React.useMemo(() => {
     const acc = new Map<number, number>();
     for (const s of (todaysShifts?.data ?? []) as any[]) {
-      const t = shiftTotalById.get(s.id) ?? 0;
-      acc.set(s.employeeId, (acc.get(s.employeeId) ?? 0) + t);
+      const t = shiftTotalById.get(Number(s.id)) ?? 0;
+      const empId = Number(s.employeeId);
+      if (Number.isFinite(empId)) {
+        acc.set(empId, (acc.get(empId) ?? 0) + t);
+      }
     }
     return acc;
   }, [todaysShifts, shiftTotalById]);
 
+  /* ---------- Keep page in sync with AddSaleLineForm's shift-change event ---------- */
+  React.useEffect(() => {
+    const onChange = async (ev: Event) => {
+      const detail = (ev as CustomEvent).detail || {};
+      const newId = Number(detail.shiftId);
+      if (!newId || !employeeId) return;
+      try {
+        // Resolve current open shift for this employee if available
+        const cur = await SalesApi.getCurrentShiftForEmployee(employeeId);
+        if ((cur as any)?.id) setShift(cur as any);
+      } catch {
+        // ignore
+      }
+    };
+    if (typeof window !== "undefined") {
+      window.addEventListener("daily-sales:active-shift-changed", onChange as any);
+      return () =>
+        window.removeEventListener("daily-sales:active-shift-changed", onChange as any);
+    }
+  }, [employeeId]);
+
   /* ---------- mutations / queries ---------- */
 
-  // Get or Open shift (uses correct API)
+  // Get or Open shift — uses the API helper that handles current/reopen/new
   const mGetOrOpen = useMutation({
     mutationFn: async () => {
       const id =
@@ -314,7 +299,12 @@ export default function DailySalesPage() {
           ?.id ||
         0;
       if (!id) throw new Error("Pick an employee from the list.");
-      const s = await getOrOpenShift(id, waiterType, tableCode || undefined);
+      const s = await SalesApi.getOrReopenOrOpenShiftForEmployee({
+        employeeId: id,
+        waiterType,
+        tableCode: tableCode || undefined,
+        date: todayStr(),
+      });
       return s;
     },
     onSuccess: (s: any) => {
@@ -331,44 +321,62 @@ export default function DailySalesPage() {
   } = useQuery<ShiftSummary>({
     enabled: !!shift?.id,
     queryKey: ["daily-sales", "summary", shift?.id],
-    queryFn: () => getShiftSummary(shift!.id),
+    queryFn: () => SalesApi.getShiftSummary(shift!.id) as unknown as Promise<ShiftSummary>,
   });
 
   const mAddSale = useMutation({
-    mutationFn: () =>
-      // FIX: backend expects { itemId, qty, unit, unitPrice, note? }
-      addShiftLine(shift!.id, {
+    mutationFn: async () =>
+      addLine({
+        shiftId: Number(shift!.id),
         itemId,
         qty,
         unit,
         unitPrice,
-        type: "ISSUE"
+        type: "SALE",
       }),
-    onSuccess: () => {
+    onSuccess: (res: any) => {
+      // If backend reopened or created a NEW shift, swap the UI to that shift id.
+      const serverShift = res?.shift;
+      if (serverShift?.id && Number(serverShift.id) !== Number(shift!.id)) {
+        setShift({
+          id: Number(serverShift.id),
+          date: String(serverShift.date ?? todayStr()).slice(0, 10),
+          employeeId: Number(serverShift.employeeId),
+          status: serverShift.closedAt ? "CLOSED" : "OPEN",
+          closedAt: serverShift.closedAt ?? null,
+          cashExpected: Number(serverShift.netSales ?? serverShift.grossSales ?? 0),
+          cashReceived: Number(serverShift.cashRemit ?? 0),
+          shortOver: 0,
+          lines: [],
+        } as any);
+      }
+
+      // Refresh list & summary for the (possibly new) shift
+      qc.invalidateQueries({ queryKey: ["daily-sales", "shifts", todayStr()] });
       refetchSummary();
+
+      // Reset the form
+      setItemId(0);
+      setItemQuery("");
+      setUnit("unit");
+      setUnitPrice(0);
       setQty(1);
       setTableCode("");
-      qc.invalidateQueries({ queryKey: ["daily-sales", "shifts", todayStr()] });
+
+      // Clear any cached per-shift total so it recomputes
       setShiftTotalById((prev) => {
         const next = new Map(prev);
-        next.delete(shift!.id);
+        next.delete(Number(serverShift?.id ?? shift!.id));
         return next;
       });
     },
   });
 
-  // Close shift (tries app service, falls back to REST)
+  // Close shift (use API helper; your API already handles fallbacks)
   const mCloseShift = useMutation({
     mutationFn: async () => {
       if (!shift?.id) throw new Error("No shift to close.");
-      if (typeof apiCloseShiftMaybe === "function") {
-        // @ts-ignore
-        return apiCloseShiftMaybe(shift.id);
-      }
-      const res = await api.post(`/daily-sales/shifts/${shift.id}/close`, {
-        notes: "Closed from UI",
-      });
-      return res.data ?? { ok: true };
+      return SalesApi.closeShift(Number(shift.id), { note: "Closed from UI" });
     },
     onSuccess: () => {
       setShift(null);
@@ -376,10 +384,34 @@ export default function DailySalesPage() {
       setItemQuery("");
       setQty(1);
       setUnitPrice(0);
-      setUnit("plate");
+      setUnit("unit");
       setTableCode("");
       qc.invalidateQueries({ queryKey: ["daily-sales", "shifts", todayStr()] });
       setShiftTotalById(new Map());
+    },
+  });
+
+  // Reopen shift (use API helper)
+  const mReopenShift = useMutation({
+    mutationFn: async () => {
+      if (!shift?.id) throw new Error("No shift selected.");
+      return SalesApi.reopenShift(Number(shift.id), "resume selling from UI");
+    },
+    onSuccess: (reopened: any) => {
+      setShift({
+        id: Number(reopened.id),
+        date: String(reopened.date ?? (reopened as any).openedAt ?? todayStr()).slice(0, 10),
+        employeeId: Number(reopened.employeeId),
+        status: reopened.closedAt ? "CLOSED" : "OPEN",
+        closedAt: reopened.closedAt ?? null,
+        cashExpected: Number((reopened as any).netSales ?? (reopened as any).grossSales ?? 0),
+        cashReceived: Number((reopened as any).cashRemit ?? 0),
+        shortOver: 0,
+        lines: [],
+      } as any);
+
+      qc.invalidateQueries({ queryKey: ["daily-sales", "shifts", todayStr()] });
+      qc.invalidateQueries({ queryKey: ["daily-sales", "summary", reopened.id] });
     },
   });
 
@@ -388,7 +420,7 @@ export default function DailySalesPage() {
     mutationFn: async () => {
       if (!shift?.id) throw new Error("No shift to save.");
       if (!summary) throw new Error("No summary to save.");
-      return createCashup(shift.id, {
+      return SalesApi.createCashup(Number(shift.id), {
         submittedBy: employeeId ? Number(employeeId) : undefined,
       });
     },
@@ -402,7 +434,7 @@ export default function DailySalesPage() {
     enabled: expandedEmp != null,
     queryKey: ["daily-sales", "cashups", todayStr(), expandedEmp],
     queryFn: () =>
-      listCashups({
+      SalesApi.listCashups({
         date: todayStr(),
         employeeId: expandedEmp ?? undefined,
         page: 1,
@@ -435,16 +467,19 @@ export default function DailySalesPage() {
   const canGetShift =
     (employeeQuery.trim().length > 0 || employeeId > 0) && !mGetOrOpen.isPending;
 
+  // Robust closed detection: from status OR closedAt
+  const isClosed = (shift as any)?.status === "CLOSED" || !!(shift as any)?.closedAt;
+
   const canAddSale =
     !!shift &&
     !mAddSale.isPending &&
     itemId > 0 &&
     qty > 0 &&
-    unitPrice > 0 &&
+    unitPrice >= 0 &&
     unit.trim().length > 0 &&
-    (!shift || (shift as any).status !== "CLOSED");
+    !isClosed;
 
-  const canCloseShift = !!shift && (shift as any)?.closedAt == null && !mCloseShift.isPending;
+  const canCloseShift = !!shift && !isClosed && !mCloseShift.isPending;
 
   /* ---------- auto-fill price + unit when picking an item ---------- */
   const applyItemDefaultsFrom = React.useCallback(
@@ -486,7 +521,12 @@ export default function DailySalesPage() {
       const missingIds: number[] = [];
       for (const row of summary.byItem) {
         const id = Number(row.itemId);
-        if (!selectedNameById.has(id) && !catalogNameById.has(id) && !lazyNames.has(id)) {
+        if (
+          Number.isFinite(id) &&
+          !selectedNameById.has(id) &&
+          !catalogNameById.has(id) &&
+          !lazyNames.has(id)
+        ) {
           missingIds.push(id);
         }
       }
@@ -565,6 +605,23 @@ export default function DailySalesPage() {
             </button>
           )}
 
+          {/* Reopen closed shift */}
+          {shift && isClosed && (
+            <button
+              type="button"
+              onClick={() => mReopenShift.mutate()}
+              className="inline-flex items-center gap-2 rounded-xl px-3 py-2 border bg-background hover:bg-muted disabled:opacity-60"
+              disabled={mReopenShift.isPending}
+              aria-busy={mReopenShift.isPending}
+              title="Reopen this shift and keep using it (no data loss)"
+            >
+              <History className="w-4 h-4" />
+              <span className="text-sm">
+                {mReopenShift.isPending ? "Reopening…" : "Reopen this shift"}
+              </span>
+            </button>
+          )}
+
           <button
             type="button"
             onClick={() => mSaveCashup.mutate()}
@@ -605,7 +662,7 @@ export default function DailySalesPage() {
         </div>
       </div>
 
-      {/* NEW: Today's totals by employee (names + per-employee cash) */}
+      {/* NEW: Today's totals by employee */}
       {showByEmployee && (
         <div className="mb-4 rounded-xl border">
           <div className="px-3 py-2 border-b bg-muted/30 flex items-center justify-between">
@@ -621,7 +678,7 @@ export default function DailySalesPage() {
             <div className="p-3 space-y-3">
               {Array.from(
                 new Map(
-                  ((todaysShifts?.data ?? []) as any[]).map((s) => [s.employeeId, true] as const)
+                  ((todaysShifts?.data ?? []) as any[]).map((s) => [Number(s.employeeId), true] as const)
                 ).keys()
               )
                 .sort((a, b) => {
@@ -632,7 +689,7 @@ export default function DailySalesPage() {
                 .map((empId) => {
                   const name = empNameById.get(empId) ?? `Employee #${empId}`;
                   const shifts = ((todaysShifts?.data ?? []) as any[]).filter(
-                    (s) => s.employeeId === empId
+                    (s) => Number(s.employeeId) === empId
                   );
                   const empTotal = totalsByEmployee.get(empId) ?? 0;
 
@@ -661,17 +718,18 @@ export default function DailySalesPage() {
                       <div className="px-3 pb-2">
                         <div className="flex flex-wrap gap-2">
                           {shifts.map((s: any) => {
-                            const total = shiftTotalById.get(s.id) ?? 0;
+                            const total = shiftTotalById.get(Number(s.id)) ?? 0;
                             const closed = !!s.closedAt;
                             return (
                               <button
                                 key={s.id}
                                 onClick={() =>
                                   setShift({
-                                    id: s.id,
+                                    id: Number(s.id),
                                     date: String(s.date).slice(0, 10),
-                                    employeeId: s.employeeId,
+                                    employeeId: Number(s.employeeId),
                                     status: closed ? "CLOSED" : "OPEN",
+                                    closedAt: s.closedAt ?? null,
                                     cashExpected: 0,
                                     cashReceived: 0,
                                     shortOver: 0,
@@ -754,10 +812,11 @@ export default function DailySalesPage() {
                 key={s.id}
                 onClick={() =>
                   setShift({
-                    id: s.id,
+                    id: Number(s.id),
                     date: String(s.date).slice(0, 10),
-                    employeeId: s.employeeId,
+                    employeeId: Number(s.employeeId),
                     status: s.closedAt ? "CLOSED" : "OPEN",
+                    closedAt: s.closedAt ?? null,
                     cashExpected: 0,
                     cashReceived: 0,
                     shortOver: 0,
@@ -769,7 +828,7 @@ export default function DailySalesPage() {
                 }`}
                 title={`Shift #${s.id} • ${s.closedAt ? "CLOSED" : "OPEN"}`}
               >
-                #{s.id} • {empNameById.get(s.employeeId) ?? s.employeeId} •{" "}
+                #{s.id} • {empNameById.get(Number(s.employeeId)) ?? s.employeeId} •{" "}
                 {s.closedAt ? "CLOSED" : "OPEN"}
               </button>
             ))}
@@ -850,7 +909,7 @@ export default function DailySalesPage() {
         {shift && (
           <span className="text-sm text-muted-foreground sm:justify-self-end">
             <strong>Shift #{shift.id}</strong>{" "}
-            • {(shift as any)?.closedAt ? "CLOSED" : "OPEN"} • {String((shift as any)?.date ?? todayStr()).slice(0,10)}
+            • {isClosed ? "CLOSED" : "OPEN"} • {String((shift as any)?.date ?? todayStr()).slice(0,10)}
           </span>
         )}
       </div>
@@ -880,17 +939,17 @@ export default function DailySalesPage() {
                 const v = e.target.value;
                 setItemQuery(v);
                 const match = menuItems.find(
-                  (it) => `${it.name} (#${it.id})` === v || it.name === v
+                  (it: { name: string; id: any }) => `${it.name} (#${it.id})` === v || it.name === v
                 );
                 if (match) {
                   handleItemPicked(match as ItemLite);
                 }
               }}
               onBlur={finalizeTypedItem}
-              disabled={!shift || (shift as any)?.closedAt != null}
+              disabled={!shift || isClosed}
             />
             <datalist id="menu-items-list">
-              {menuItems.map((it) => (
+              {menuItems.map((it: { id: React.Key | null | undefined; name: any }) => (
                 <option key={it.id} value={`${it.name} (#${it.id})`} />
               ))}
             </datalist>
@@ -907,12 +966,13 @@ export default function DailySalesPage() {
             <input
               id="qty"
               type="number"
-              inputMode="numeric"
-              min={1}
+              inputMode="decimal"
+              min={0.01}
+              step="0.01"
               value={qty}
               onChange={(e) => setQty(Number(e.target.value))}
               className="mt-1 w-full rounded-xl border px-3 py-2 bg-background"
-              disabled={!shift || (shift as any)?.closedAt != null}
+              disabled={!shift || isClosed}
             />
           </div>
 
@@ -927,7 +987,7 @@ export default function DailySalesPage() {
               onChange={(e) => setUnit(e.target.value)}
               className="mt-1 w-full rounded-xl border px-3 py-2 bg-background"
               placeholder="plate / bottle / glass"
-              disabled={!shift || (shift as any)?.closedAt != null}
+              disabled={!shift || isClosed}
             />
           </div>
 
@@ -946,7 +1006,7 @@ export default function DailySalesPage() {
               onChange={(e) => setUnitPrice(Number(e.target.value))}
               className="mt-1 w-full rounded-xl border px-3 py-2 bg-background"
               placeholder="e.g. 80"
-              disabled={!shift || (shift as any)?.closedAt != null}
+              disabled={!shift || isClosed}
             />
             <p className="mt-1 text-xs text-muted-foreground">Auto-filled from menu when you pick an item.</p>
           </div>
@@ -971,7 +1031,7 @@ export default function DailySalesPage() {
                 onChange={(e) => setTableCode(e.target.value)}
                 className="mt-1 w-full rounded-xl border px-3 py-2 bg-background"
                 placeholder="A6 / A7…"
-                disabled={!shift || (shift as any)?.closedAt != null}
+                disabled={!shift || isClosed}
               />
             </div>
             <div className="flex items-end">
@@ -1073,32 +1133,43 @@ export default function DailySalesPage() {
           <div className="flex items-center justify-between gap-2 mb-2">
             <h2 className="text-lg font-semibold">Cash-up Snapshot (Shift #{shift.id})</h2>
           </div>
-          {!qCashup.isFetching && qCashup.data === null ? (
-            <p className="text-sm text-muted-foreground">
-              Snapshot endpoint not available yet on the server.
-            </p>
-          ) : qCashup.isFetching ? (
+
+          {qCashup.isFetching ? (
             <p className="text-sm text-muted-foreground">Loading…</p>
+          ) : qCashup.isError ? (
+            <p className="text-sm text-red-600">
+              Couldn’t load snapshot{(qCashup.error as any)?.message ? `: ${(qCashup.error as any).message}` : "."}
+            </p>
+          ) : qCashup.data == null ? (
+            <p className="text-sm text-muted-foreground">No snapshot found.</p>
           ) : (
             <div className="rounded-xl border p-3 text-sm">
-              {"snapshot" in (qCashup.data as any) ? (
-                <pre className="whitespace-pre-wrap break-words">
-                  {JSON.stringify((qCashup.data as any).snapshot, null, 2)}
-                </pre>
-              ) : (qCashup.data as any)?.snapshots?.length ? (
-                <div className="space-y-3">
-                  {(qCashup.data as any).snapshots.map((s: any, i: number) => (
-                    <div key={i} className="rounded-lg border p-2">
-                      <div className="text-muted-foreground mb-1">Saved at: {s.at}</div>
-                      <pre className="whitespace-pre-wrap break-words">
-                        {JSON.stringify(s.payload, null, 2)}
-                      </pre>
+              {(() => {
+                const data: any = qCashup.data;
+                if (data && typeof data === "object" && "snapshot" in data) {
+                  return (
+                    <pre className="whitespace-pre-wrap break-words">
+                      {JSON.stringify(data.snapshot, null, 2)}
+                    </pre>
+                  );
+                }
+                const snaps = Array.isArray(data?.snapshots) ? data.snapshots : [];
+                if (snaps.length > 0) {
+                  return (
+                    <div className="space-y-3">
+                      {snaps.map((s: any, i: number) => (
+                        <div key={i} className="rounded-lg border p-2">
+                          <div className="text-muted-foreground mb-1">Saved at: {s.at}</div>
+                          <pre className="whitespace-pre-wrap break-words">
+                            {JSON.stringify(s.payload, null, 2)}
+                          </pre>
+                        </div>
+                      ))}
                     </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="text-muted-foreground">No snapshot found.</div>
-              )}
+                  );
+                }
+                return <div className="text-muted-foreground">No snapshot found.</div>;
+              })()}
             </div>
           )}
         </div>

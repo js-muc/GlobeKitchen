@@ -1,9 +1,9 @@
 // apps/web/lib/api.sales.ts
-// LABEL: API_SALES_V8
+// LABEL: API_SALES_V10
 // - Preserves original exports & behavior
-// - Aligns with /daily-sales/* backend you shared
-// - Adds grouped-today + daily rollup helpers
-// - Safer headers & error handling
+// - Adds addSaleLine() that returns { ok, line, shift } so UI can adopt the server's active shift
+// - Keeps addShiftLine() legacy behavior (returns only the line) by delegating to addSaleLine()
+// - Re-implements getCurrentShiftForEmployee(employeeId) using /daily-sales/shifts list (server has no /for-employee/current endpoint)
 
 import { SERVER_API } from "@/lib/config";
 import { getAuthToken } from "@/lib/api";
@@ -67,9 +67,9 @@ export type ShiftListItem = {
   waiterType?: string;
   openedAt?: string | null;
   closedAt?: string | null;
-  grossSales?: number;
-  netSales?: number;
-  cashRemit?: number | null;
+  grossSales?: number | string;
+  netSales?: number | string;
+  cashRemit?: number | string | null;
   notes?: string | null;
 };
 
@@ -95,10 +95,8 @@ export type TodayGroupedResponse = {
 
 /** ----- Utilities ----- */
 function todayYmd() {
-  const d = new Date();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${d.getFullYear()}-${m}-${day}`;
+  // local YYYY-MM-DD (works across timezones)
+  return new Date().toLocaleDateString("en-CA");
 }
 
 /** Normalize server shift payload into the UI’s Shift shape */
@@ -107,14 +105,17 @@ function normalizeShift(raw: any): Shift {
   const ymd = (iso || "").slice(0, 10);
   const status: ShiftStatus = raw?.status ?? (raw?.closedAt ? "CLOSED" : "OPEN");
 
+  // server numeric fields may come as strings
+  const num = (v: any) => (typeof v === "string" ? Number(v) : Number(v ?? 0)) || 0;
+
   return {
     id: Number(raw?.id ?? 0),
     date: ymd || todayYmd(),
     employeeId: Number(raw?.employeeId ?? 0),
     status,
-    cashExpected: Number(raw?.cashExpected ?? raw?.netSales ?? raw?.grossSales ?? 0),
-    cashReceived: Number(raw?.cashReceived ?? raw?.cashRemit ?? 0),
-    shortOver: Number(raw?.shortOver ?? 0),
+    cashExpected: num(raw?.cashExpected ?? raw?.netSales ?? raw?.grossSales),
+    cashReceived: num(raw?.cashReceived ?? raw?.cashRemit),
+    shortOver: num(raw?.shortOver),
     lines: Array.isArray(raw?.lines) ? raw.lines : [],
   };
 }
@@ -173,8 +174,7 @@ const isHttpError = (e: unknown): e is { status?: number } =>
 /** ----- API calls (aligned to /daily-sales routes) ----- */
 
 /**
- * Open (or get) a shift.
- * Signature preserved; server is idempotent.
+ * Open (or get) a shift — server is idempotent.
  * POST /daily-sales/shifts/open
  */
 export async function createOrGetShift(
@@ -198,8 +198,51 @@ export async function createOrGetShift(
   return normalizeShift(data?.shift ?? data);
 }
 
+/**
+ * Resolve current open shift for an employee (by employeeId).
+ * There is no server endpoint for "for-employee/current", so we:
+ * - list today’s shifts for that employee
+ * - pick the open one if any; otherwise the latest
+ */
+export async function getCurrentShiftForEmployee(employeeId: number) {
+  const today = todayYmd();
+  const list = await listShifts({
+    dateFrom: today,
+    dateTo: today,
+    employeeId,
+    page: 1,
+    limit: 50,
+  });
+
+  const rows = Array.isArray(list?.data) ? list.data : [];
+  if (!rows.length) {
+    throw Object.assign(new Error("no_shift_today"), { status: 404 });
+  }
+
+  // prefer open; else latest by openedAt/id
+  const open = rows.find((r) => !r.closedAt);
+  if (open) return normalizeShift(open);
+
+  const latest = [...rows].sort((a, b) => {
+    const aTime = new Date(a.openedAt ?? 0).getTime() || (a as any).id || 0;
+    const bTime = new Date(b.openedAt ?? 0).getTime() || (b as any).id || 0;
+    return bTime - aTime;
+  })[0];
+
+  return normalizeShift(latest);
+}
+
+/** NEW: reopen a closed shift */
+export async function reopenShift(shiftId: number, reason = "resume selling") {
+  const data = await http<any>(`/daily-sales/shifts/${shiftId}/reopen`, {
+    method: "POST",
+    body: JSON.stringify({ reason }),
+  });
+  return normalizeShift(data?.shift ?? data);
+}
+
 export type LinePayload = {
-  type: "ISSUE" | "ADD" | "RETURN" | "SALE" | "ADJUSTMENT"; // accepted by caller; server ignores today
+  type?: "ISSUE" | "ADD" | "RETURN" | "SALE" | "ADJUSTMENT"; // optional on server
   itemId: number;
   qty: number;
   unit: string;
@@ -209,9 +252,40 @@ export type LinePayload = {
 };
 
 /**
- * Add a line to a shift.
- * POST /daily-sales/lines (supports SALE add)
+ * NEW: Add a line and return the server's { ok, line, shift }.
+ * Always use this in places where the active shift may change
+ * (e.g., adding to a previously closed shift or after cashup).
+ *
+ * POST /daily-sales/lines
  */
+export async function addSaleLine(body: {
+  shiftId: number;
+  itemId: number;
+  qty: number;
+  unitPrice: number;
+  unit?: string;
+  note?: string;
+}): Promise<{ ok: true; line: any; shift: any }> {
+  const data = await http<any>(`/daily-sales/lines`, {
+    method: "POST",
+    body: JSON.stringify({
+      shiftId: body.shiftId,
+      itemId: body.itemId,
+      qty: body.qty,
+      unitPrice: body.unitPrice,
+      unit: body.unit,
+      note: body.note ?? undefined,
+    }),
+  });
+  // server returns { ok, line, shift }
+  return data as { ok: true; line: any; shift: any };
+}
+
+/**
+ * LEGACY: Add a line and return only the created line (preserved behavior).
+ * Now delegates to addSaleLine(), discarding the shift so old callers don’t break.
+ */
+// return both line and (maybe) shift so UI can swap to the new id
 export async function addShiftLine(shiftId: number, payload: LinePayload) {
   const body = {
     shiftId,
@@ -227,8 +301,10 @@ export async function addShiftLine(shiftId: number, payload: LinePayload) {
     body: JSON.stringify(body),
   });
 
-  return (data?.line ?? data) as { id: number } & LinePayload;
+  // data may look like { ok, line, shift }
+  return data as { ok: boolean; line: any; shift?: any };
 }
+
 
 /** GET /daily-sales/shifts/:id/summary (fallback derives from lines) */
 export async function getShiftSummary(shiftId: number): Promise<ShiftSummary> {
@@ -282,7 +358,7 @@ export async function getShiftSummary(shiftId: number): Promise<ShiftSummary> {
 /**
  * Close a shift (preferred then fallbacks).
  * 1) POST /daily-sales/shifts/:id/close
- * 2) PATCH /daily-sales/shifts/:id (if your server supports it)
+ * 2) PATCH /daily-sales/shifts/:id  (legacy/optional)
  * 3) POST /daily-sales/shifts/close (legacy)
  */
 export async function closeShift(
@@ -317,7 +393,7 @@ export async function closeShift(
   return normalizeShift(final?.shift ?? final);
 }
 
-/** POST /daily-sales/shifts/:id/cashup (server-side snapshot) */
+/** POST /daily-sales/shifts/:id/cashup */
 export async function createCashup(shiftId: number, payload: CashupInput = {}) {
   return http<any>(`/daily-sales/shifts/${shiftId}/cashup`, {
     method: "POST",
@@ -388,4 +464,72 @@ export async function getDailyRollup(date: string = todayYmd()) {
   return http<{ byItem: SummaryRow[]; totals: { cashDue: number; lines: number } }>(
     `/daily-sales/summary/daily?date=${encodeURIComponent(date)}`
   );
+}
+
+/** -----------------------------------------------------------------
+ *  NEW: Reopen-first helper for UI flows
+ *  Try current -> latest today (reopen if closed) -> open new
+ *  ----------------------------------------------------------------- */
+export async function getOrReopenOrOpenShiftForEmployee(args: {
+  employeeId: number;
+  waiterType?: "INSIDE" | "FIELD";
+  tableCode?: string;
+  date?: string; // default today
+}): Promise<Shift> {
+  const date = args.date ?? todayYmd();
+
+  // 1) Try an existing open/current shift for the employee
+  try {
+    const cur = await getCurrentShiftForEmployee(args.employeeId);
+    if (cur?.id) return cur;
+  } catch (e: any) {
+    const status = (e && (e as any).status) || (e?.detail as any)?.status;
+    if (status && status !== 404) throw e;
+  }
+
+  // 2) Look for today's latest shift and reopen if it is closed
+  try {
+    const list = await listShifts({
+      dateFrom: date,
+      dateTo: date,
+      employeeId: args.employeeId,
+      page: 1,
+      limit: 50,
+    });
+
+    const rows = Array.isArray(list?.data) ? list.data : [];
+    if (rows.length) {
+      const latest = [...rows].sort((a: any, b: any) => {
+        const aTime = new Date(a.openedAt ?? a.createdAt ?? 0).getTime() || a.id || 0;
+        const bTime = new Date(b.openedAt ?? b.createdAt ?? 0).getTime() || b.id || 0;
+        return bTime - aTime;
+      })[0];
+
+      if (latest && latest.closedAt) {
+        await reopenShift(latest.id, "resume selling");
+        // after reopen, try to re-resolve the current open shift:
+        try {
+          const cur = await getCurrentShiftForEmployee(args.employeeId);
+          if (cur?.id) return cur;
+        } catch {
+          // if still not visible, fall back to normalized latest
+        }
+        return normalizeShift(latest);
+      }
+
+      if (latest && !latest.closedAt) {
+        return normalizeShift(latest);
+      }
+    }
+  } catch {
+    // ignore and try opening below
+  }
+
+  // 3) Nothing today -> open new (idempotent)
+  return createOrGetShift({
+    date,
+    employeeId: args.employeeId,
+    waiterType: args.waiterType ?? "INSIDE",
+    tableCode: args.tableCode,
+  });
 }

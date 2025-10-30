@@ -38,6 +38,13 @@ services:
       # 👇 helps file watching on Windows (tsx/chokidar)
       CHOKIDAR_USEPOLLING: "true"
       CHOKIDAR_INTERVAL: "300"
+
+      # ✅ Local testing: bypass auth middleware (requireAuth/requireAdmin)
+      #    Turn OFF (set to "0" or remove) for real auth.
+      BYPASS_AUTH: "1"
+      # (Optional) while debugging, you can add a server-side guard tied to:
+      # BLOCK_AUTO_CLOSE: "1"
+
     depends_on:
       db:
         condition: service_healthy
