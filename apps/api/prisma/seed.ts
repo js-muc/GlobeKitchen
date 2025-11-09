@@ -5,19 +5,17 @@ const prisma = new PrismaClient();
 
 type SeedItem = {
   name: string;
-  priceSell: number;        // selling price in KES
-  category?: string | null; // optional category label
-  unit?: string;            // defaults to 'plate'
-  costUnit?: number | null; // leave null for now
+  priceSell: number;
+  category?: string | null;
+  unit?: string;
+  costUnit?: number | null;
   active?: boolean;
 };
 
 const items: SeedItem[] = [
-  // Handwritten items at top of the page
-  { name: "Chips with Fish",  priceSell: 300, category: "Food" }, // from top margin
-  { name: "Chips with Beef",  priceSell: 300, category: "Food" }, // from top margin
+  { name: "Chips with Fish",  priceSell: 300, category: "Food" },
+  { name: "Chips with Beef",  priceSell: 300, category: "Food" },
 
-  // Printed list
   { name: "Mbuzi Choma Ugali 1/4",    priceSell: 350, category: "Food" },
   { name: "Mbuzi Chemsha Ugali 1/4",  priceSell: 350, category: "Food" },
   { name: "Mbuzi Choma Rice",         priceSell: 380, category: "Food" },
@@ -34,16 +32,13 @@ const items: SeedItem[] = [
 
   { name: "Mala Ugali",               priceSell: 170, category: "Food" },
 
-  // These three were a bit fuzzy in the photo; please confirm the exact prices if needed
-  { name: "Githeri Plain",            priceSell: 200, category: "Food" }, // TODO: confirm (looked ~200)
+  { name: "Githeri Plain",            priceSell: 200, category: "Food" },
   { name: "Githeri Nyama",            priceSell: 250, category: "Food" },
-  { name: "Chips Plain",              priceSell: 180, category: "Food" }, // TODO: confirm (looked ~180)
+  { name: "Chips Plain",              priceSell: 180, category: "Food" },
 
   { name: "Chicken Ugali",            priceSell: 400, category: "Food" },
-
-  // The next two lines were hard to read; set to 400 for now—please confirm
-  { name: "Chicken With 2 Chapo",     priceSell: 400, category: "Food" }, // TODO: confirm
-  { name: "Chicken With 1 Chapo",     priceSell: 400, category: "Food" }, // TODO: confirm
+  { name: "Chicken With 2 Chapo",     priceSell: 400, category: "Food" },
+  { name: "Chicken With 1 Chapo",     priceSell: 400, category: "Food" },
 
   { name: "Minji Nyama With Chapati", priceSell: 250, category: "Food" },
   { name: "Minji Nyama With Rice",    priceSell: 250, category: "Food" },
@@ -54,15 +49,7 @@ const items: SeedItem[] = [
 ];
 
 async function upsertMenuItem(it: SeedItem) {
-  const {
-    name,
-    priceSell,
-    category = "Food",
-    unit = "plate",
-    costUnit = null,
-    active = true,
-  } = it;
-
+  const { name, priceSell, category = "Food", unit = "plate", costUnit = null, active = true } = it;
   const existing = await prisma.menuItem.findFirst({ where: { name } });
   if (existing) {
     await prisma.menuItem.update({
@@ -76,16 +63,29 @@ async function upsertMenuItem(it: SeedItem) {
   }
 }
 
+// NEW: salaried employee so payroll can run
+async function upsertDefaultEmployee() {
+  const $ = prisma as any; // bypass stale TS types for new fields/enums
+  await $.employee.upsert({
+    where: { id: 1 },
+    update: { salaryMonthly: "30000", active: true }, // Decimal as string is fine
+    create: {
+      id: 1,
+      name: "Default Waiter",
+      role: "WAITER",   // enum value as string
+      type: "INSIDE",   // enum value as string
+      active: true,
+      salaryMonthly: "30000",
+    },
+  });
+}
+
 async function main() {
-  for (const it of items) {
-    await upsertMenuItem(it);
-  }
-  console.log(`Seeded ${items.length} menu items ✅`);
+  await upsertDefaultEmployee();
+  for (const it of items) await upsertMenuItem(it);
+  console.log(`Seeded employee #1 and ${items.length} menu items ✅`);
 }
 
 main()
-  .catch((e) => {
-    console.error(e);
-    process.exit(1);
-  })
+  .catch((e) => { console.error(e); process.exit(1); })
   .finally(() => prisma.$disconnect());

@@ -186,8 +186,9 @@ export default function DashboardPage() {
               </div>
             </Link>
 
+            {/* 🔁 UPDATED: route to Field Hub */}
             <Link
-              href="/field-sales"
+              href="/admin/field"
               className="group block rounded-2xl focus:outline-none focus-visible:ring-2 focus-visible:ring-brand focus-visible:ring-offset-2"
             >
               <div className="rounded-[var(--radius-2xl)] border bg-white p-5 transition group-hover:shadow-md">

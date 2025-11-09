@@ -37,6 +37,30 @@ function pageMeta(total: number, page: number, limit: number) {
   };
 }
 
+/* ----------------------- Type-safe snapshot helpers ----------------------- */
+/**
+ * Snapshot stored in shift.cashup.snapshot is a JSON column.
+ * Its TypeScript type is a JsonValue (union). Accessing properties
+ * directly causes TS errors. Use runtime checks first.
+ */
+function isObject(v: any): v is Record<string, any> {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+/** Safely extract commission.amount from a snapshot, or 0 */
+function getCommissionFromSnapshot(snapshot: any): number {
+  try {
+    if (!isObject(snapshot)) return 0;
+    const c = snapshot.commission;
+    if (!isObject(c)) return 0;
+    const amount = c.amount;
+    const n = Number(amount ?? 0);
+    return Number.isFinite(n) ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
 /* ----------------------- /reports/overview ----------------------- */
 /**
  * GET /api/reports/overview
@@ -47,8 +71,7 @@ function pageMeta(total: number, page: number, limit: number) {
  * - payroll runs in last 90 days + last run stamp
  * - server time
  *
- * NOTE: Kept independent of auth middleware to preserve current behavior (all other routes stay unchanged).
- * If you want it protected, add your auth middleware here.
+ * NOTE: Payroll is commission-only; this route stays public as before.
  */
 r.get("/overview", async (req, res) => {
   try {
@@ -245,7 +268,7 @@ r.get("/stock", async (req, res) => {
  * GET /api/reports/sales?date=YYYY-MM-DD
  * Optionally filter by waiterId: /api/reports/sales?date=...&waiterId=1
  * Returns aggregate totals for the day (table sales + field ops).
- * (Fix: accurate line-item sums; shape preserved)
+ * NOTE: Payroll is commission-only; these figures are sales inputs to commission, not fixed salaries.
  */
 r.get("/sales", async (req, res) => {
   try {
@@ -287,7 +310,7 @@ r.get("/sales", async (req, res) => {
     const fdParams = waiterId ? [start, end, waiterId] : [start, end];
     const [dispatchAgg] = await prisma.$queryRawUnsafe<any[]>(fdSql, ...fdParams);
 
-    // ----- FIELD RETURN (same semantics as before; not filtered by waiter) -----
+    // ----- FIELD RETURN (not filtered by waiter; totals for the day) -----
     const [returnAgg] = await prisma.$queryRawUnsafe<any[]>(`
       SELECT
         COALESCE(SUM("qtyReturned"), 0)                           AS "returnedQty",
@@ -331,6 +354,85 @@ r.get("/sales", async (req, res) => {
   } catch (e: any) {
     console.error("GET /reports/sales error:", e);
     return res.status(500).json({ error: "failed_to_generate_sales_report", detail: e?.message });
+  }
+});
+
+/* ----------------------- /reports/employee/daily ----------------------- */
+/**
+ * GET /api/reports/employee/daily?date=YYYY-MM-DD
+ * Returns per-employee snapshot for the given date (or today by default).
+ * Each entry contains:
+ *  - employeeId, name, type, role
+ *  - inside: dailySales, commission (preview)
+ *  - field: cashCollected, commission (preview)
+ *  - shiftSnapshot: snapshot object from shiftCashup (if any) — preserves original stored snapshot
+ *
+ * Implementation note: this aggregates using existing queries and shift/cashup snapshots.
+ * It is intentionally conservative to preserve storage semantics of your system.
+ */
+r.get("/employee/daily", async (req, res) => {
+  try {
+    const dateISO = req.query.date ? String(req.query.date) : undefined;
+    const day = dateISO ? new Date(dateISO) : new Date();
+    const start = new Date(day); start.setHours(0, 0, 0, 0);
+    const end   = new Date(day); end.setHours(23, 59, 59, 999);
+
+    // load employees (small set; acceptable for admin auditing)
+    const employees = await prisma.employee.findMany({
+      select: { id: true, name: true, role: true, type: true, phone: true },
+      orderBy: { name: 'asc' }
+    });
+
+    // fetch shifts and their cashup snapshots for the day
+    // Note: we select cashup.snapshot which is a JSON column
+    const shiftRows = await prisma.shift.findMany({
+      where: { date: { gte: start, lt: end } },
+      select: { id: true, employeeId: true, waiterType: true, netSales: true, cashup: { select: { id: true, snapshot: true } } }
+    });
+
+    // compute field cash per waiter using dispatch date and returns (use dispatch.date window)
+    const fieldRows = await prisma.$queryRawUnsafe<any[]>(`
+      SELECT fd."waiterId" AS "waiterId",
+             COALESCE(SUM(fr."cashCollected"),0) AS "cashCollected"
+      FROM "FieldDispatch" fd
+      LEFT JOIN "FieldReturn" fr ON fr."dispatchId" = fd.id
+      WHERE fd."date" >= $1 AND fd."date" < $2
+      GROUP BY fd."waiterId"
+    `, start, end);
+
+    const fieldMap = new Map<number, number>();
+    (fieldRows || []).forEach((r: any) => { fieldMap.set(Number(r.waiterId), Number(r.cashCollected || 0)); });
+
+    // prepare per-employee response
+    const rows = employees.map(e => {
+      // find inside shift (if any)
+      const insideShift = shiftRows.find(s => s.employeeId === e.id && s.waiterType === 'INSIDE');
+      const insideSales = insideShift?.netSales ? Number(insideShift.netSales) : 0;
+      const insideCommission = getCommissionFromSnapshot(insideShift?.cashup?.snapshot);
+
+      // find field shift (if any) to get field commission snapshot
+      const fieldShift = shiftRows.find(s => s.employeeId === e.id && s.waiterType === 'FIELD');
+      const fieldCommission = getCommissionFromSnapshot(fieldShift?.cashup?.snapshot);
+
+      const fieldCash = fieldMap.get(e.id) ?? 0;
+
+      const shiftSnapshot = insideShift?.cashup?.snapshot ?? null;
+
+      return {
+        employeeId: e.id,
+        name: e.name,
+        role: e.role,
+        type: e.type,
+        inside: { dailySales: insideSales, commission: insideCommission },
+        field: { cashCollected: fieldCash, commission: fieldCommission },
+        shiftSnapshot,
+      };
+    });
+
+    return res.json({ date: start.toISOString().slice(0,10), items: rows });
+  } catch (e: any) {
+    console.error('GET /reports/employee/daily error:', e);
+    return res.status(500).json({ error: 'failed_to_generate_employee_daily', detail: e?.message });
   }
 });
 

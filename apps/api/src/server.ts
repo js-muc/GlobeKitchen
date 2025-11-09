@@ -1,32 +1,21 @@
 // apps/api/src/server.ts
-import express from "express";
-import cors from "cors";
-import helmet from "helmet";
-import cookieParser from "cookie-parser";
-import morgan from "morgan";
-import compression from "compression";
-import responseTime from "response-time";
-import routes from "./routes/index.js";
-import { ENV } from "./config/env.js";
+// Entry point that boots the Express server safely in NodeNext mode.
 
+import type { Express } from "express";
+// Namespace import to be safe under NodeNext
+import * as indexMod from "./index.js";
 
-const app = express();
+// Use default export if available, otherwise fallback to module object
+const app: Express = (indexMod as any).default ?? (indexMod as any);
 
-app.disable("x-powered-by");
-app.use(helmet({ crossOriginResourcePolicy: false }));
-app.use(cors({ origin: ENV.CORS_ORIGINS, credentials: true }));
-app.use(compression());
-app.use(responseTime());
-app.use(express.json({ limit: "1mb" }));
-app.use(cookieParser());
+const PORT = Number(process.env.PORT || 4000);
+
+// Start server (guard tests)
 if (process.env.NODE_ENV !== "test") {
-  app.use(morgan("dev"));
+  app.listen(PORT, () => {
+    console.log(`🚀 API running on http://localhost:${PORT}`);
+    console.log(`📘 OpenAPI docs at http://localhost:${PORT}/api/docs`);
+  });
 }
-
-app.get("/health", (_req, res) => res.json({ ok: true }));
-
-app.use("/api", routes);
-
-app.use((_req, res) => res.status(404).json({ error: "Not Found" }));
 
 export default app;

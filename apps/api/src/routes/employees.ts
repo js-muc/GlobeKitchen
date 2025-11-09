@@ -1,5 +1,4 @@
-﻿// apps/api/src/routes/employees.ts
-import { Router } from "express";
+﻿import { Router } from "express";
 import { PrismaClient } from "@prisma/client";
 import { validateBody } from "../utils/validate.js";
 import { zEmployeeCreate, zEmployeeUpdate } from "../schemas/index.js";
@@ -65,7 +64,12 @@ function mapTypeAlias(
   next();
 }
 
-function serializeEmployee(e: any) {
+/**
+ * IMPORTANT:
+ * - `salaryMonthly` is now **legacy** and NOT used for payroll. We keep it stored for history only.
+ * - Public GET responses **omit** this field to avoid confusion.
+ */
+function serializeEmployeePublic(e: any) {
   return {
     id: e.id,
     name: e.name,
@@ -75,6 +79,14 @@ function serializeEmployee(e: any) {
     phone: e.phone ?? null,
     active: e.active,
     createdAt: e.createdAt,
+    // salaryMonthly intentionally omitted from public output
+  };
+}
+
+/** Admin/debug view if needed in the future */
+function serializeEmployeeWithLegacy(e: any) {
+  return {
+    ...serializeEmployeePublic(e),
     salaryMonthly: moneyStr(e.salaryMonthly ?? "0"),
   };
 }
@@ -94,9 +106,14 @@ r.get("/", async (req, res) => {
   const { hasPaging, page, limit, skip, take } = getPageParams(req.query);
 
   try {
+    // Allow an admin toggle to reveal legacy salary for debugging: ?debugSalary=1
+    const revealLegacy = String(req.query.debugSalary ?? "") === "1";
+
     if (!hasPaging) {
       const rows = await prisma.employee.findMany({ orderBy: { id: "asc" } });
-      return res.json(rows.map(serializeEmployee));
+      return res.json(
+        rows.map((e) => (revealLegacy ? serializeEmployeeWithLegacy(e) : serializeEmployeePublic(e)))
+      );
     }
 
     const [rows, total] = await Promise.all([
@@ -105,7 +122,7 @@ r.get("/", async (req, res) => {
     ]);
 
     return res.json({
-      data: rows.map(serializeEmployee),
+      data: rows.map((e) => (revealLegacy ? serializeEmployeeWithLegacy(e) : serializeEmployeePublic(e))),
       meta: pageMeta(total, page, limit),
     });
   } catch (e: any) {
@@ -132,7 +149,7 @@ r.post(
         tableCode = null,
         phone = null,
         active = true,
-        salaryMonthly,
+        salaryMonthly, // legacy; stored but ignored by payroll
       } = req.body;
 
       const normalizedSalary = normalizeIncomingSalary(salaryMonthly);
@@ -140,7 +157,7 @@ r.post(
       if (normalizedSalary !== undefined) data.salaryMonthly = normalizedSalary;
 
       const row = await prisma.employee.create({ data });
-      return res.status(201).json(serializeEmployee(row));
+      return res.status(201).json(serializeEmployeePublic(row));
     } catch (e: any) {
       console.error("POST /employees error:", e);
       return res
@@ -165,12 +182,13 @@ r.put(
 
       const normalizedSalary = normalizeIncomingSalary(salaryMonthly);
       const data: any = { name, role, type, tableCode, phone, active };
+      // We still persist legacy salary if provided, but payroll ignores it.
       if (normalizedSalary !== undefined) data.salaryMonthly = normalizedSalary;
 
       const row = await prisma.employee.update({ where: { id }, data });
-      return res.json(serializeEmployee(row));
+      return res.json(serializeEmployeePublic(row));
     } catch (e: any) {
-      if (e?.code === "P2025") {
+      if ((e as any)?.code === "P2025") {
         return res.status(404).json({ error: "not_found" });
       }
       console.error("PUT /employees/:id error:", e);
@@ -224,7 +242,7 @@ r.delete("/:id", requireAuth, requireAdmin, writeLimiter, async (req, res) => {
 
     return res.status(204).end();
   } catch (e: any) {
-    if (e?.code === "P2025") {
+    if ((e as any)?.code === "P2025") {
       return res.status(404).json({ error: "not_found" });
     }
     console.error("DELETE /employees/:id error:", e);
@@ -257,7 +275,8 @@ export default r;
  *         phone: { type: string, nullable: true, example: null }
  *         active: { type: boolean, example: true }
  *         createdAt: { type: string, format: date-time }
- *         salaryMonthly: { type: string, example: "30000.00", description: "Decimal serialized as string (2dp)" }
+ *       description: >
+ *         Public responses intentionally omit salary fields. Payroll is commission-only.
  *     PageMeta:
  *       type: object
  *       properties:

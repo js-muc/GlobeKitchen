@@ -1,0 +1,5 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": { "types": ["node", "jest"] },
+  "include": ["src/**/*.test.ts", "src/**/__tests__/**/*.ts", "src/types/**/*.d.ts"]
+}

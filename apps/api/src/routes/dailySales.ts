@@ -34,9 +34,8 @@ const zIdParam = z.object({
 /** ---------- Date helpers (Nairobi business day) ---------- */
 /** Convert YYYY-MM-DD to UTC midnight Date (no timezone drift) */
 function dateOnlyToUtc(d: string) {
-  const parts = d.split("-").map(Number);
-  const dt = new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0, 0);
-  return new Date(Date.UTC(dt.getFullYear(), dt.getMonth(), dt.getDate()));
+  const [y, m, day] = d.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, day, 0, 0, 0, 0));
 }
 
 /** Today as Nairobi calendar day "YYYY-MM-DD" */
@@ -296,6 +295,13 @@ const zAddSaleLine = z.object({
   note: z.string().trim().optional(),
 });
 
+/**
+ * POST /api/daily-sales/lines
+ * Preserves original behavior, but if the shift is CLOSED:
+ *  - If NO cashup exists for that shift → REOPEN it (notes annotated), then add line.
+ *  - If cashup exists → OPEN a NEW shift for same day/employee/waiterType, then add line.
+ * Always returns { ok, line, shift } where `shift` is the one actually used.
+ */
 r.post("/lines", requireAuth, requireAdmin, writeLimiter, async (req, res) => {
   try {
     const parsed = zAddSaleLine.safeParse(req.body);
@@ -306,15 +312,52 @@ r.post("/lines", requireAuth, requireAdmin, writeLimiter, async (req, res) => {
     }
     const { shiftId, itemId, qty, unitPrice, unit, note } = parsed.data;
 
-    const shift = await shiftModel.findUnique({ where: { id: shiftId } });
+    let shift = await shiftModel.findUnique({ where: { id: shiftId } });
     if (!shift) return res.status(404).json({ error: "shift_not_found" });
-    if (shift.closedAt) return res.status(400).json({ error: "shift_closed" });
+
+    // If the shift is closed, handle reopen-first-or-create-new
+    if (shift.closedAt) {
+      // Is there a cashup row for this shift?
+      const hasCashup =
+        !!(await shiftCashupModel?.findFirst?.({
+          where: { shiftId: shift.id },
+          select: { id: true },
+        }));
+
+      if (!hasCashup) {
+        // Reopen the same shift
+        const marker = `\n\n[REOPEN:${new Date().toISOString()}] ${JSON.stringify({
+          prevClosedAt: shift.closedAt,
+          reassignedTo: shift.employeeId,
+        })}`;
+        shift = await shiftModel.update({
+          where: { id: shift.id },
+          data: { closedAt: null, notes: (shift.notes ?? "") + marker },
+        });
+      } else {
+        // Start a fresh shift for the same day/employee/waiterType
+        const now = new Date();
+        const fresh = await shiftModel.create({
+          data: {
+            date: shift.date,
+            employeeId: shift.employeeId,
+            waiterType: shift.waiterType,
+            openedAt: now,
+            openingFloat: null,
+            tableCode: shift.tableCode ?? null,
+            route: shift.route ?? null,
+            notes: (shift.notes ?? "") + `\n\n[NEW_AFTER_CASHUP:${now.toISOString()}]`,
+          },
+        });
+        shift = fresh;
+      }
+    }
 
     const total = Number((qty * unitPrice).toFixed(2));
 
     const line = await saleLineModel.create({
       data: {
-        shiftId,
+        shiftId: shift.id,
         itemId,
         qty,
         unitPrice,
@@ -326,14 +369,15 @@ r.post("/lines", requireAuth, requireAdmin, writeLimiter, async (req, res) => {
     });
 
     await shiftModel.update({
-      where: { id: shiftId },
+      where: { id: shift.id },
       data: {
         grossSales: { increment: total },
         netSales: { increment: total },
       },
     });
 
-    return res.status(201).json({ ok: true, line });
+    // IMPORTANT: return the active shift so FE can switch state
+    return res.status(201).json({ ok: true, line, shift });
   } catch (e: any) {
     console.error("POST /daily-sales/lines error:", e);
     return res
@@ -428,6 +472,9 @@ r.post("/shifts/:id(\\d+)/close", requireAuth, requireAdmin, writeLimiter, async
 
     return res.json({ ok: true, shift: updated });
   } catch (e: any) {
+    // Before validation, at the top of the handler body:
+
+
     console.error("POST /daily-sales/shifts/:id/close error:", e);
     return res
       .status(500)
