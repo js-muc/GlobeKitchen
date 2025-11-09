@@ -1,5 +1,5 @@
 // C:\GlobeKitchen\apps\web\app\daily-sales\page.tsx
-// LABEL: PAGE_DAILY_SALES_V17 (patched)
+// LABEL: PAGE_DAILY_SALES_V18 (regenerated — visual polish, kiosk mode, branded receipt + dev credit)
 "use client";
 
 import React from "react";
@@ -100,8 +100,7 @@ type AddLineFn = (args: {
 
 const addLine: AddLineFn = async (args) => {
   const fn =
-    (SalesApi as any).addSaleLine ??
-    (SalesApi as any).addShiftLine; // both exist in API_SALES_V10
+    (SalesApi as any).addSaleLine ?? (SalesApi as any).addShiftLine; // both exist in API_SALES_V10
   if (typeof fn !== "function") throw new Error("Sales API add-line function not found.");
   const res = await fn(args);
   return res as { ok: boolean; line: any; shift?: any };
@@ -130,6 +129,9 @@ export default function DailySalesPage() {
   const [showByEmployee, setShowByEmployee] = React.useState<boolean>(true);
   const [expandedEmp, setExpandedEmp] = React.useState<number | null>(null);
 
+  /* Top-level ephemeral message (toast-like) */
+  const [topMessage, setTopMessage] = React.useState<{ type: "info" | "error" | "success"; text: string } | null>(null);
+
   /* Live line total */
   const lineTotal = React.useMemo(() => toNum(qty) * toNum(unitPrice), [qty, unitPrice]);
 
@@ -141,8 +143,7 @@ export default function DailySalesPage() {
   // Today’s shifts (history strip)
   const { data: todaysShifts } = useQuery({
     queryKey: ["daily-sales", "shifts", todayStr()],
-    queryFn: () =>
-      SalesApi.listShifts({ dateFrom: todayStr(), dateTo: todayStr(), page: 1, limit: 200 }),
+    queryFn: () => SalesApi.listShifts({ dateFrom: todayStr(), dateTo: todayStr(), page: 1, limit: 200 }),
     staleTime: 30_000,
   });
 
@@ -176,20 +177,13 @@ export default function DailySalesPage() {
     return m;
   }, [itemsCatalog]);
 
-  const [selectedNameById, setSelectedNameById] = React.useState<Map<number, string>>(
-    () => new Map()
-  );
+  const [selectedNameById, setSelectedNameById] = React.useState<Map<number, string>>(() => new Map());
   const [lazyNames, setLazyNames] = React.useState<Map<number, string>>(() => new Map());
 
   const resolveItemName = React.useCallback(
     (id: number | string): string => {
       const nid = Number(id);
-      return (
-        selectedNameById.get(nid) ||
-        catalogNameById.get(nid) ||
-        lazyNames.get(nid) ||
-        `Item #${nid}`
-      );
+      return selectedNameById.get(nid) || catalogNameById.get(nid) || lazyNames.get(nid) || `Item #${nid}`;
     },
     [catalogNameById, selectedNameById, lazyNames]
   );
@@ -199,12 +193,8 @@ export default function DailySalesPage() {
   React.useEffect(() => {
     (async () => {
       const ids: number[] =
-        (todaysShifts?.data?.map((s: any) => Number(s.employeeId)) ?? []).filter(
-          (n: number) => Number.isFinite(n) && n > 0
-        );
-      const unique: number[] = Array.from(new Set<number>(ids)).filter(
-        (id: number) => !empNameById.has(id)
-      );
+        (todaysShifts?.data?.map((s: any) => Number(s.employeeId)) ?? []).filter((n: number) => Number.isFinite(n) && n > 0);
+      const unique: number[] = Array.from(new Set<number>(ids)).filter((id: number) => !empNameById.has(id));
       if (unique.length === 0) return;
       const results = await Promise.all(
         unique.map(async (id: number) => {
@@ -226,9 +216,7 @@ export default function DailySalesPage() {
   }, [todaysShifts, empNameById]);
 
   /* ---------- PER-SHIFT TOTALS + PER-EMPLOYEE TOTALS ---------- */
-  const [shiftTotalById, setShiftTotalById] = React.useState<Map<number, number>>(
-    () => new Map()
-  );
+  const [shiftTotalById, setShiftTotalById] = React.useState<Map<number, number>>(() => new Map());
   React.useEffect(() => {
     (async () => {
       const list: any[] = todaysShifts?.data ?? [];
@@ -283,20 +271,24 @@ export default function DailySalesPage() {
     };
     if (typeof window !== "undefined") {
       window.addEventListener("daily-sales:active-shift-changed", onChange as any);
-      return () =>
-        window.removeEventListener("daily-sales:active-shift-changed", onChange as any);
+      return () => window.removeEventListener("daily-sales:active-shift-changed", onChange as any);
     }
   }, [employeeId]);
 
   /* ---------- mutations / queries ---------- */
+
+  // Helper to show top message briefly
+  const flash = React.useCallback((type: "info" | "error" | "success", text: string, ttl = 5000) => {
+    setTopMessage({ type, text });
+    setTimeout(() => setTopMessage(null), ttl);
+  }, []);
 
   // Get or Open shift — uses the API helper that handles current/reopen/new
   const mGetOrOpen = useMutation({
     mutationFn: async () => {
       const id =
         employeeId ||
-        employees.find((e) => `${e.name} (#${e.id})` === employeeQuery || e.name === employeeQuery)
-          ?.id ||
+        employees.find((e) => `${e.name} (#${e.id})` === employeeQuery || e.name === employeeQuery)?.id ||
         0;
       if (!id) throw new Error("Pick an employee from the list.");
       const s = await SalesApi.getOrReopenOrOpenShiftForEmployee({
@@ -311,14 +303,25 @@ export default function DailySalesPage() {
       setShift(s);
       if (s?.employeeId) setEmployeeId(Number(s.employeeId));
       qc.invalidateQueries({ queryKey: ["daily-sales", "shifts", todayStr()] });
+      flash("success", `Shift ${s?.id ? "#" + s.id : "opened"}`);
+    },
+    onError: (err: any) => {
+      // Be friendly for conflicts — backends often return 409 for already-open shift
+      const message =
+        err?.response?.data?.message || err?.message || "Couldn’t open shift. Check employee or existing shift.";
+      // if http status 409 present, suggest switching to existing shift
+      const status = err?.response?.status ?? err?.status;
+      if (status === 409) {
+        flash("error", `${message} — another shift is already open. Refreshing today’s shifts.`);
+        // refresh list so user can pick existing shift
+        qc.invalidateQueries({ queryKey: ["daily-sales", "shifts", todayStr()] });
+      } else {
+        flash("error", message);
+      }
     },
   });
 
-  const {
-    data: summary,
-    refetch: refetchSummary,
-    isFetching,
-  } = useQuery<ShiftSummary>({
+  const { data: summary, refetch: refetchSummary, isFetching } = useQuery<ShiftSummary>({
     enabled: !!shift?.id,
     queryKey: ["daily-sales", "summary", shift?.id],
     queryFn: () => SalesApi.getShiftSummary(shift!.id) as unknown as Promise<ShiftSummary>,
@@ -369,6 +372,12 @@ export default function DailySalesPage() {
         next.delete(Number(serverShift?.id ?? shift!.id));
         return next;
       });
+
+      flash("success", "Line added.");
+    },
+    onError: (err: any) => {
+      const message = err?.response?.data?.message || err?.message || "Failed to add line.";
+      flash("error", message);
     },
   });
 
@@ -388,6 +397,11 @@ export default function DailySalesPage() {
       setTableCode("");
       qc.invalidateQueries({ queryKey: ["daily-sales", "shifts", todayStr()] });
       setShiftTotalById(new Map());
+      flash("success", "Shift closed. Use Get Shift to open a new one.");
+    },
+    onError: (err: any) => {
+      const message = err?.response?.data?.message || err?.message || "Failed to close shift.";
+      flash("error", message);
     },
   });
 
@@ -412,6 +426,10 @@ export default function DailySalesPage() {
 
       qc.invalidateQueries({ queryKey: ["daily-sales", "shifts", todayStr()] });
       qc.invalidateQueries({ queryKey: ["daily-sales", "summary", reopened.id] });
+      flash("success", "Shift reopened.");
+    },
+    onError: (err: any) => {
+      flash("error", err?.message || "Failed to reopen shift.");
     },
   });
 
@@ -426,6 +444,10 @@ export default function DailySalesPage() {
     },
     onSuccess: () => {
       if (showCashup) qc.invalidateQueries({ queryKey: ["daily-sales", "cashup", shift?.id] });
+      flash("success", "Cash-up snapshot saved.");
+    },
+    onError: (err: any) => {
+      flash("error", err?.message || "Failed to save cashup.");
     },
   });
 
@@ -460,12 +482,15 @@ export default function DailySalesPage() {
       qc.invalidateQueries({
         queryKey: ["daily-sales", "cashups", todayStr(), expandedEmp],
       });
+      flash("success", "Snapshot deleted.");
+    },
+    onError: (err: any) => {
+      flash("error", err?.message || "Failed to delete snapshot.");
     },
   });
 
   /* ---------- derived ---------- */
-  const canGetShift =
-    (employeeQuery.trim().length > 0 || employeeId > 0) && !mGetOrOpen.isPending;
+  const canGetShift = (employeeQuery.trim().length > 0 || employeeId > 0) && !mGetOrOpen.isPending;
 
   // Robust closed detection: from status OR closedAt
   const isClosed = (shift as any)?.status === "CLOSED" || !!(shift as any)?.closedAt;
@@ -482,14 +507,11 @@ export default function DailySalesPage() {
   const canCloseShift = !!shift && !isClosed && !mCloseShift.isPending;
 
   /* ---------- auto-fill price + unit when picking an item ---------- */
-  const applyItemDefaultsFrom = React.useCallback(
-    (it: Partial<ItemLite> | undefined | null) => {
-      if (!it) return;
-      if (it.priceSell != null) setUnitPrice(Number(it.priceSell));
-      if (it.unit) setUnit(it.unit);
-    },
-    []
-  );
+  const applyItemDefaultsFrom = React.useCallback((it: Partial<ItemLite> | undefined | null) => {
+    if (!it) return;
+    if (it.priceSell != null) setUnitPrice(Number(it.priceSell));
+    if (it.unit) setUnit(it.unit);
+  }, []);
 
   const handleItemPicked = React.useCallback(
     (picked: ItemLite | null) => {
@@ -549,698 +571,1087 @@ export default function DailySalesPage() {
         return next;
       });
     })();
-  }, [summary, catalogNameById, selectedNameById, lazyNames]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [summary]);
+
+  /* ---------- Printing helpers (client-side receipt) ---------- */
+  function escapeHtml(str = "") {
+    return String(str).replace(/[&<>"']/g, (m) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" } as any)[m]
+    );
+  }
+
+  const printReceiptForShift = React.useCallback(
+    async (opts?: { singleItemId?: number }) => {
+      // Try to fetch a fresh summary for the shift so the receipt is reliable
+      let bodySummary: ShiftSummary | null = summary ?? null;
+      if (shift?.id) {
+        try {
+          bodySummary = (await SalesApi.getShiftSummary(shift.id)) as unknown as ShiftSummary;
+        } catch {
+          // ignore and fallback to existing summary
+        }
+      }
+
+      const lines = (bodySummary?.byItem ?? []).filter((r) =>
+        opts?.singleItemId ? Number(r.itemId) === Number(opts.singleItemId) : true
+      );
+
+      const total = toNum(bodySummary?.totals?.cashDue ?? 0);
+
+      const tillNumber = process.env.NEXT_PUBLIC_TILL_NUMBER ?? "TILL-001";
+      const waiterName = empNameById.get(employeeId) ?? employeeQuery ?? `#${employeeId}`;
+
+      // branded, hotel-grade receipt + developer credit
+      const printable = `
+      <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>Receipt</title>
+        <style>
+          body{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial; margin: 8px; color:#111;}
+          .receipt{ width: 320px; max-width: 320px; }
+          h2{ margin:0; font-size:16px; text-align:center; color:#064e3b; letter-spacing:0.2px; }
+          .meta{ font-size:11px; margin:6px 0; text-align:center; color:#6b7280; }
+          table{ width:100%; border-collapse: collapse; font-size:13px; margin-top:6px;}
+          td{ padding:6px 0; vertical-align:top; }
+          .qty{ width:14%; text-align:left; font-weight:600; color:#0f172a; }
+          .name{ width:56%; text-align:left; padding-left:6px; color:#111827; }
+          .price{ width:30%; text-align:right; color:#065f46; font-weight:700; }
+          .total { font-weight:800; font-size:16px; margin-top:10px; text-align:right; color:#0f172a; }
+          .center{ text-align:center; margin-top:8px; font-size:12px; color:#374151; }
+          hr{ border: none; border-top:1px solid #e6f4ea; margin:8px 0; }
+          .till{ margin-top:8px; text-align:center; font-size:13px; color:#065f46; font-weight:700; }
+          .devcredit{ margin-top:10px; text-align:center; font-size:11px; color:#475569; border-top:1px dashed #e6eef0; padding-top:8px;}
+          @media print { body{ margin:0; } .receipt{ width: 80mm; } }
+        </style>
+      </head>
+      <body>
+      <div class="receipt">
+        <h2>Globe Organic Kitchen</h2>
+        <div class="meta">${new Date().toLocaleString()}</div>
+        <div class="meta">Shift: ${escapeHtml(String(shift?.id ?? "—"))} • Waiter: ${escapeHtml(String(waiterName ?? "—"))}</div>
+        <hr/>
+        <table>
+          ${lines
+            .map(
+              (l) =>
+                `<tr><td class="qty">${escapeHtml(String(toNum((l as any).sold) || 1))}</td><td class="name">${escapeHtml(
+                  resolveItemName(l.itemId)
+                )}${l.unit ? " • " + escapeHtml(String(l.unit)) : ""}</td><td class="price">${fmtMoney((l as any).cashDue ?? (l as any).price ?? 0)}</td></tr>`
+            )
+            .join("")}
+        </table>
+        <hr/>
+        <div class="total">TOTAL: ${fmtMoney(total)}</div>
+        <div class="till">Till: ${escapeHtml(tillNumber)}</div>
+        <div class="center">Thank you — Please visit again</div>
+        <div class="devcredit">System developers: Hotel gurus call. 0790472773</div>
+      </div>
+      </body>
+      </html>
+      `;
+      const w = window.open("", "_blank", "width=420,height=640");
+      if (!w) {
+        flash("error", "Pop-up blocked. Allow pop-ups to print receipts.");
+        return;
+      }
+      w.document.write(printable);
+      w.document.close();
+      setTimeout(() => {
+        try {
+          w.print();
+        } catch {
+          // ignore
+        }
+      }, 400);
+    },
+    [shift, summary, employeeId, employeeQuery, empNameById, flash, resolveItemName]
+  );
 
   const printSummary = React.useCallback(() => window.print(), []);
 
+  /* ---------- keyboard shortcuts & touch-friendly helpers ---------- */
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      // Ctrl/Cmd + P => print summary (kiosk: may still open print dialog)
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "p") {
+        e.preventDefault();
+        printSummary();
+      }
+
+      // If Enter pressed while item input focused, finalize typed item (mobile keyboards)
+      if (e.key === "Enter") {
+        const active = document.activeElement as HTMLElement | null;
+        if (active?.id === "itemName") {
+          // finalize typed item to pick from fuzzy match
+          finalizeTypedItem();
+        }
+      }
+
+      // Ctrl+Enter to add sale (quick shortcut)
+      if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+        if (canAddSale) {
+          e.preventDefault();
+          mAddSale.mutate();
+        }
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [finalizeTypedItem, canAddSale, mAddSale, printSummary]);
+
+  /* ---------- auto-fill price + unit when picking an item ---------- */
+  React.useEffect(() => {
+    // If itemQuery matches an item from menuItems, auto-pick
+    const match = menuItems.find((it: any) => `${it.name} (#${it.id})` === itemQuery || it.name === itemQuery);
+    if (match) handleItemPicked(match as ItemLite);
+  }, [itemQuery, menuItems, handleItemPicked]);
+
+  /* ---------- Lazy fetch names missing in summary (kept as original) ---------- */
+  React.useEffect(() => {
+    (async () => {
+      if (!summary?.byItem?.length) return;
+      const missingIds: number[] = [];
+      for (const row of summary.byItem) {
+        const id = Number(row.itemId);
+        if (
+          Number.isFinite(id) &&
+          !selectedNameById.has(id) &&
+          !catalogNameById.has(id) &&
+          !lazyNames.has(id)
+        ) {
+          missingIds.push(id);
+        }
+      }
+      if (!missingIds.length) return;
+      const fetched = await Promise.all(
+        missingIds.map(async (id) => {
+          try {
+            const res = await api.get(`/items/${id}`);
+            const it = res.data?.data ?? res.data;
+            const name = it?.name ?? it?.title ?? `Item #${id}`;
+            return { id, name: String(name) };
+          } catch {
+            return { id, name: `Item #${id}` };
+          }
+        })
+      );
+      setLazyNames((prev) => {
+        const next = new Map(prev);
+        for (const f of fetched) next.set(f.id, f.name);
+        return next;
+      });
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [summary]);
+
+  /* ---------- clock (for header) ---------- */
+  /* ---------- clock (client-only, prevents hydration mismatch) ---------- */
+/* Start as null so server renders the same HTML every time (no time text).
+   On the client we set the live time+date inside useEffect. */
+const [clock, setClock] = React.useState<{ time: string; date: string } | null>(null);
+
+React.useEffect(() => {
+  const fmtTime = () => new Date().toLocaleTimeString();
+  const fmtDate = () => new Date().toLocaleDateString("en-CA"); // stable YYYY-MM-DD style
+  // set initial value once client has mounted
+  setClock({ time: fmtTime(), date: fmtDate() });
+
+  const t = setInterval(() => setClock({ time: fmtTime(), date: fmtDate() }), 1000);
+  return () => clearInterval(t);
+}, []);
+
+
+  /* ---------- kiosk mode detection ---------- */
+  const [kioskMode, setKioskMode] = React.useState(false);
+  React.useEffect(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      setKioskMode(params.get("kiosk") === "1");
+    } catch {
+      setKioskMode(false);
+    }
+  }, []);
+
   /* ---------- UI ---------- */
+
+  // If kioskMode: render simplified full-screen POS (no DashboardShell)
+  if (kioskMode) {
+    return (
+      <div className="min-h-screen bg-emerald-50 p-4">
+        <div className="max-w-[1200px] mx-auto">
+          {/* Header (compact) */}
+          <header className="flex items-center gap-4 mb-4">
+            <div className="rounded-full bg-white p-3 shadow-sm border">
+              <Search className="w-6 h-6 text-emerald-600" />
+            </div>
+            <div className="min-w-0">
+              <h1 className="text-2xl font-semibold text-slate-900">POS — Inside Waiters</h1>
+              <div className="text-sm text-slate-600">
+                {clock ? `${clock.time} • ${clock.date}` : "—"}
+              </div>
+
+            </div>
+            <div className="ml-auto">
+              <button
+                onClick={() => window.location.assign("/")}
+                className="rounded-lg px-3 py-2 bg-white border hover:bg-emerald-50"
+              >
+                Exit Kiosk
+              </button>
+            </div>
+          </header>
+
+          <div className="grid grid-cols-1 lg:grid-cols-[360px_1fr] gap-6">
+            {/* Left */}
+            <aside className="space-y-4">
+              <div className="rounded-xl border p-4 bg-white/90 backdrop-blur-sm shadow-lg">
+                <div className="text-xs text-slate-500">Current Shift</div>
+                <div className="mt-1 flex items-baseline gap-2">
+                  <div className="text-lg font-semibold text-slate-900">{shift ? `#${shift.id}` : "—"}</div>
+                  <div className="text-sm text-slate-600">{shift ? (isClosed ? "CLOSED" : "OPEN") : "No shift"}</div>
+                </div>
+                <div className="text-xs text-slate-500 mt-2">Employee</div>
+                <div className="text-sm font-medium">{empNameById.get(Number(shift?.employeeId)) ?? (shift?.employeeId ? `#${shift.employeeId}` : "—")}</div>
+                <div className="text-xs text-slate-400 mt-2">Cash Due</div>
+                <div className="text-2xl font-bold text-emerald-700">₵ {fmtMoney(summary?.totals?.cashDue ?? 0)}</div>
+
+                <div className="mt-4 grid gap-2">
+                  <button
+                    onClick={() => mGetOrOpen.mutate()}
+                    disabled={!canGetShift}
+                    className="w-full rounded-lg px-4 py-3 text-white bg-emerald-600 hover:bg-emerald-700 shadow disabled:opacity-60"
+                  >
+                    {mGetOrOpen.isPending ? "Loading..." : shift ? "Switch Shift" : "Get Shift"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => mSaveCashup.mutate()}
+                    disabled={!shift || !summary || mSaveCashup.isPending}
+                    className="w-full inline-flex items-center justify-center gap-2 rounded-lg px-4 py-3 bg-white border hover:bg-emerald-50"
+                  >
+                    <Save className="w-4 h-4 text-emerald-600" />
+                    Save Cash-up
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!shift) { flash("error", "Open a shift first."); return; }
+                      printReceiptForShift();
+                    }}
+                    disabled={!shift}
+                    className="w-full inline-flex items-center justify-center gap-2 rounded-lg px-4 py-3 bg-white border hover:bg-emerald-50"
+                  >
+                    <Printer className="w-4 h-4 text-emerald-600" />
+                    Print Receipt
+                  </button>
+                </div>
+              </div>
+            </aside>
+
+            {/* Right: main */}
+            <main>
+              {/* Get/Open shift card */}
+              <div className="rounded-xl border p-4 bg-white/90 backdrop-blur-sm shadow-lg mb-4">
+                <div className="grid grid-cols-1 sm:grid-cols-[minmax(220px,420px)_200px_140px_1fr] gap-3 items-end">
+                  <div>
+                    <label className="text-sm font-medium text-slate-700">Employee</label>
+                    <input
+                      className="mt-1 w-full rounded-lg border px-3 py-3 focus:outline-none focus:ring-2 focus:ring-emerald-200"
+                      placeholder="Type name…"
+                      value={employeeQuery}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        setEmployeeQuery(v);
+                        const match = employees.find((emp) => `${emp.name} (#${emp.id})` === v || emp.name === v);
+                        if (match) setEmployeeId(match.id);
+                      }}
+                    />
+                  </div>
+
+                  <div>
+                    <label className="text-sm font-medium text-slate-700">Waiter Type</label>
+                    <select
+                      className="mt-1 w-full rounded-lg border px-3 py-3 focus:outline-none focus:ring-2 focus:ring-emerald-200"
+                      value={waiterType}
+                      onChange={(e) => setWaiterType(e.target.value as "INSIDE" | "FIELD")}
+                    >
+                      <option value="INSIDE">INSIDE</option>
+                      <option value="FIELD">FIELD</option>
+                    </select>
+                  </div>
+
+                  <div className="flex items-center">
+                    <button
+                      onClick={() => mGetOrOpen.mutate()}
+                      disabled={!canGetShift}
+                      className="w-full rounded-lg px-4 py-3 text-white bg-emerald-600 hover:bg-emerald-700 shadow disabled:opacity-60"
+                    >
+                      {mGetOrOpen.isPending ? "Loading..." : shift ? "Get / Open Shift" : "Get Shift"}
+                    </button>
+                  </div>
+
+                  <div className="text-right text-sm text-slate-600">
+                    <div><strong>Shift #{shift?.id ?? "—"}</strong></div>
+                    <div className="mt-1">{isClosed ? "CLOSED" : "OPEN"} • {String((shift as any)?.date ?? todayStr()).slice(0,10)}</div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Quick SALE entry card */}
+              <div className="rounded-xl border p-4 bg-white/90 backdrop-blur-sm shadow-lg">
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    if (!itemId && itemQuery) finalizeTypedItem();
+                    if (canAddSale) mAddSale.mutate();
+                  }}
+                  className="space-y-4"
+                >
+                  <div className="grid grid-cols-1 xl:grid-cols-[minmax(220px,420px)_repeat(3,1fr)_minmax(160px,1fr)] gap-3">
+                    {/* Item search */}
+                    <div>
+                      <label className="text-sm font-medium text-slate-700">Item</label>
+                      <input
+                        list="menu-items-list"
+                        className="mt-1 w-full rounded-lg border px-3 py-3 focus:outline-none focus:ring-2 focus:ring-emerald-200"
+                        placeholder="Type to search…"
+                        value={itemQuery}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          setItemQuery(v);
+                          const match = menuItems.find(
+                            (it: { name: string; id: any }) => `${it.name} (#${it.id})` === v || it.name === v
+                          );
+                          if (match) handleItemPicked(match as ItemLite);
+                        }}
+                        onBlur={finalizeTypedItem}
+                        disabled={!shift || isClosed}
+                        autoFocus
+                      />
+                      <datalist id="menu-items-list">
+                        {menuItems.map((it: { id: React.Key | null | undefined; name: any }) => (
+                          <option key={it.id} value={`${it.name} (#${it.id})`} />
+                        ))}
+                      </datalist>
+                      <p className="mt-1 text-xs text-slate-500">{itemId ? `Selected: ${resolveItemName(itemId)} (#${itemId})` : "Pick an item"}</p>
+                    </div>
+
+                    {/* Qty */}
+                    <div>
+                      <label className="text-sm font-medium text-slate-700">Qty</label>
+                      <input
+                        id="qty"
+                        type="number"
+                        inputMode="decimal"
+                        min={0.01}
+                        step="0.01"
+                        value={qty}
+                        onChange={(e) => setQty(Number(e.target.value))}
+                        className="mt-1 w-full rounded-lg border px-3 py-3 focus:outline-none focus:ring-2 focus:ring-emerald-200"
+                        disabled={!shift || isClosed}
+                      />
+                    </div>
+
+                    {/* Unit */}
+                    <div>
+                      <label className="text-sm font-medium text-slate-700">Unit</label>
+                      <input
+                        id="unit"
+                        value={unit}
+                        onChange={(e) => setUnit(e.target.value)}
+                        className="mt-1 w-full rounded-lg border px-3 py-3 focus:outline-none focus:ring-2 focus:ring-emerald-200"
+                        placeholder="plate / bottle / glass"
+                        disabled={!shift || isClosed}
+                      />
+                    </div>
+
+                    {/* Unit Price */}
+                    <div>
+                      <label className="text-sm font-medium text-slate-700">Unit Price</label>
+                      <input
+                        id="unitPrice"
+                        type="number"
+                        inputMode="decimal"
+                        step="0.01"
+                        min={0}
+                        value={unitPrice || ""}
+                        onChange={(e) => setUnitPrice(Number(e.target.value))}
+                        className="mt-1 w-full rounded-lg border px-3 py-3 focus:outline-none focus:ring-2 focus:ring-emerald-200"
+                        placeholder="e.g. 80"
+                        disabled={!shift || isClosed}
+                      />
+                      <p className="mt-1 text-xs text-slate-500">Auto-filled from menu when you pick an item.</p>
+                    </div>
+
+                    {/* Live Line Total */}
+                    <div className="rounded-lg border p-4 flex items-center justify-between bg-emerald-50">
+                      <div className="text-sm text-slate-700">Line Total</div>
+                      <div className="text-2xl font-semibold tabular-nums text-emerald-700">{fmtMoney(lineTotal)}</div>
+                    </div>
+
+                    {/* Table + submit */}
+                    <div className="xl:col-span-full grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label className="text-sm font-medium text-slate-700">Table (inside only)</label>
+                        <input
+                          id="tableCode"
+                          value={tableCode}
+                          onChange={(e) => setTableCode(e.target.value)}
+                          className="mt-1 w-full rounded-lg border px-3 py-3 focus:outline-none focus:ring-2 focus:ring-emerald-200"
+                          placeholder="A6 / A7…"
+                          disabled={!shift || isClosed}
+                        />
+                      </div>
+                      <div className="flex items-end gap-3">
+                        <button
+                          type="submit"
+                          disabled={!canAddSale}
+                          className="w-full sm:w-auto rounded-lg px-6 py-3 text-white bg-emerald-600 hover:bg-emerald-700 shadow disabled:opacity-60 transition-transform active:scale-95"
+                          aria-busy={mAddSale.isPending}
+                        >
+                          {mAddSale.isPending ? "Adding…" : "Add SALE line"}
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (!shift) {
+                              flash("error", "Open a shift to print a receipt.");
+                              return;
+                            }
+                            printReceiptForShift();
+                          }}
+                          disabled={!shift}
+                          className="rounded-lg px-6 py-3 border bg-white hover:bg-emerald-50"
+                        >
+                          <Printer className="inline-block w-4 h-4 mr-2 -mt-1 text-emerald-600" />
+                          <span className="text-sm">Print Receipt</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </form>
+
+                {/* Inline feedback */}
+                <div className="mt-3 min-h-[1.4rem]">
+                  {mAddSale.isError && <div className="text-sm text-red-600">Failed to add line. Check values and try again.</div>}
+                  {mAddSale.isSuccess && <div className="text-sm text-emerald-700">Line added.</div>}
+                  {mSaveCashup.isError && <div className="text-sm text-red-600">Failed to save cash-up. Please try again.</div>}
+                  {mSaveCashup.isSuccess && <div className="text-sm text-emerald-700">Cash-up snapshot saved.</div>}
+                  {mCloseShift.isError && <div className="text-sm text-red-600">Failed to close shift. Please try again.</div>}
+                  {mCloseShift.isSuccess && <div className="text-sm text-emerald-700">Shift closed. Use "Get Shift" to open a new one.</div>}
+                  {mGetOrOpen.isError && <div className="text-sm text-red-600">Couldn’t get/open a shift. Pick an employee from the list and try again.</div>}
+                </div>
+              </div>
+            </main>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Normal mode (inside DashboardShell)
   return (
     <DashboardShell>
-      {/* Header */}
-      <div className="flex flex-col lg:flex-row lg:items-center gap-3 mb-4">
-        <div className="inline-flex items-center justify-center rounded-xl border p-2 w-10 h-10">
-          <Search className="w-5 h-5" />
-        </div>
-        <div className="min-w-0">
-          <h1 className="text-xl font-semibold">Daily Sales</h1>
-          <p className="text-sm text-muted-foreground">
-            Get or reopen a shift, record sales, and view totals.
-          </p>
-        </div>
-
-        {/* Actions */}
-        <div className="mt-2 lg:mt-0 lg:ml-auto flex flex-wrap gap-2">
-          <button
-            type="button"
-            onClick={() => setShowByEmployee((s) => !s)}
-            className="inline-flex items-center gap-2 rounded-xl px-3 py-2 border bg-background hover:bg-muted"
-            title="Show today by employee"
+      {/* Top ephemeral message area (toast-like) */}
+      <div className="fixed left-1/2 -translate-x-1/2 top-6 z-50 pointer-events-none">
+        {topMessage && (
+          <div
+            className={`pointer-events-auto px-4 py-2 rounded-lg shadow-md transition-transform ${
+              topMessage.type === "error"
+                ? "bg-red-600 text-white"
+                : topMessage.type === "success"
+                ? "bg-emerald-600 text-white"
+                : "bg-slate-800 text-white"
+            }`}
           >
-            <User2 className="w-4 h-4" />
-            <span className="text-sm">By Employee</span>
-            <ChevronDown className={`w-4 h-4 transition-transform ${showByEmployee ? "rotate-180" : ""}`} />
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setShowDaily((s) => !s)}
-            className="inline-flex items-center gap-2 rounded-xl px-3 py-2 border bg-background hover:bg-muted"
-            title="View whole-day rollup"
-          >
-            <History className="w-4 h-4" />
-            <span className="text-sm">Daily Rollup</span>
-            <ChevronDown className={`w-4 h-4 transition-transform ${showDaily ? "rotate-180" : ""}`} />
-          </button>
-
-          {shift && (
-            <button
-              type="button"
-              onClick={() => setShowCashup((s) => !s)}
-              className="inline-flex items-center gap-2 rounded-xl px-3 py-2 border bg-background hover:bg-muted"
-              title="View last saved cash-up snapshot"
-            >
-              <CircleDashed className="w-4 h-4" />
-              <span className="text-sm">Cash-up Snapshot</span>
-              <ChevronDown className={`w-4 h-4 transition-transform ${showCashup ? "rotate-180" : ""}`} />
-            </button>
-          )}
-
-          {/* Reopen closed shift */}
-          {shift && isClosed && (
-            <button
-              type="button"
-              onClick={() => mReopenShift.mutate()}
-              className="inline-flex items-center gap-2 rounded-xl px-3 py-2 border bg-background hover:bg-muted disabled:opacity-60"
-              disabled={mReopenShift.isPending}
-              aria-busy={mReopenShift.isPending}
-              title="Reopen this shift and keep using it (no data loss)"
-            >
-              <History className="w-4 h-4" />
-              <span className="text-sm">
-                {mReopenShift.isPending ? "Reopening…" : "Reopen this shift"}
-              </span>
-            </button>
-          )}
-
-          <button
-            type="button"
-            onClick={() => mSaveCashup.mutate()}
-            disabled={!shift || !summary || mSaveCashup.isPending}
-            className="inline-flex items-center gap-2 rounded-xl px-3 py-2 border bg-background hover:bg-muted disabled:opacity-60"
-            title="Save a snapshot on the server for the cashier"
-            aria-busy={mSaveCashup.isPending}
-          >
-            <Save className="w-4 h-4" />
-            <span className="text-sm">
-              {mSaveCashup.isPending ? "Saving…" : "Save for Cashier"}
-            </span>
-          </button>
-
-          <button
-            type="button"
-            onClick={printSummary}
-            disabled={!summary}
-            className="inline-flex items-center gap-2 rounded-xl px-3 py-2 border bg-background hover:bg-muted disabled:opacity-60"
-          >
-            <Printer className="w-4 h-4" />
-            <span className="text-sm">Print Summary</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => mCloseShift.mutate()}
-            disabled={!canCloseShift}
-            className="inline-flex items-center gap-2 rounded-xl px-3 py-2 text-white bg-red-600 hover:bg-red-700 shadow disabled:opacity-60"
-            aria-busy={mCloseShift.isPending}
-            title="Close current shift"
-          >
-            <XCircle className="w-4 h-4" />
-            <span className="text-sm">
-              {mCloseShift.isPending ? "Closing…" : "Close Shift"}
-            </span>
-          </button>
-        </div>
-      </div>
-
-      {/* NEW: Today's totals by employee */}
-      {showByEmployee && (
-        <div className="mb-4 rounded-xl border">
-          <div className="px-3 py-2 border-b bg-muted/30 flex items-center justify-between">
-            <div className="text-sm font-semibold">Today by Employee</div>
-            <div className="text-xs text-muted-foreground">
-              {todaysShifts?.data?.length ?? 0} shifts
-            </div>
+            <div className="text-sm">{topMessage.text}</div>
           </div>
-
-          {!(todaysShifts?.data?.length ?? 0) ? (
-            <div className="p-3 text-sm text-muted-foreground">No shifts yet today.</div>
-          ) : (
-            <div className="p-3 space-y-3">
-              {Array.from(
-                new Map(
-                  ((todaysShifts?.data ?? []) as any[]).map((s) => [Number(s.employeeId), true] as const)
-                ).keys()
-              )
-                .sort((a, b) => {
-                  const an = empNameById.get(a) ?? `#${a}`;
-                  const bn = empNameById.get(b) ?? `#${b}`;
-                  return an.localeCompare(bn);
-                })
-                .map((empId) => {
-                  const name = empNameById.get(empId) ?? `Employee #${empId}`;
-                  const shifts = ((todaysShifts?.data ?? []) as any[]).filter(
-                    (s) => Number(s.employeeId) === empId
-                  );
-                  const empTotal = totalsByEmployee.get(empId) ?? 0;
-
-                  return (
-                    <div key={empId} className="rounded-lg border">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setExpandedEmp((cur) => (cur === empId ? null : empId))
-                        }
-                        className="w-full flex items-center justify-between gap-2 px-3 py-2 bg-background hover:bg-muted rounded-t-lg"
-                      >
-                        <div className="flex items-center gap-2">
-                          <User2 className="w-4 h-4" />
-                          <span className="font-medium">{name}</span>
-                          <span className="text-xs text-muted-foreground">
-                            ({shifts.length} {shifts.length === 1 ? "shift" : "shifts"})
-                          </span>
-                        </div>
-                        <div className="text-sm font-semibold tabular-nums">
-                          ₵ {fmtMoney(empTotal)}
-                        </div>
-                      </button>
-
-                      {/* Shift chips */}
-                      <div className="px-3 pb-2">
-                        <div className="flex flex-wrap gap-2">
-                          {shifts.map((s: any) => {
-                            const total = shiftTotalById.get(Number(s.id)) ?? 0;
-                            const closed = !!s.closedAt;
-                            return (
-                              <button
-                                key={s.id}
-                                onClick={() =>
-                                  setShift({
-                                    id: Number(s.id),
-                                    date: String(s.date).slice(0, 10),
-                                    employeeId: Number(s.employeeId),
-                                    status: closed ? "CLOSED" : "OPEN",
-                                    closedAt: s.closedAt ?? null,
-                                    cashExpected: 0,
-                                    cashReceived: 0,
-                                    shortOver: 0,
-                                    lines: [],
-                                  } as any)
-                                }
-                                className={`px-2 py-1 rounded-full border text-xs ${
-                                  shift?.id === s.id ? "bg-muted" : "bg-background hover:bg-muted"
-                                }`}
-                                title={`Shift #${s.id} • ${closed ? "CLOSED" : "OPEN"}`}
-                              >
-                                #{s.id} • {closed ? "CLOSED" : "OPEN"} • ₵ {fmtMoney(total)}
-                              </button>
-                            );
-                          })}
-                        </div>
-                      </div>
-
-                      {/* Cash-up snapshots per employee (for today) */}
-                      {expandedEmp === empId && (
-                        <div className="border-t px-3 py-2 text-sm">
-                          {qEmpCashups.isFetching ? (
-                            <div className="text-muted-foreground">Loading snapshots…</div>
-                          ) : (qEmpCashups.data?.data?.length ?? 0) === 0 ? (
-                            <div className="text-muted-foreground">No snapshots for today.</div>
-                          ) : (
-                            <div className="space-y-2">
-                              {qEmpCashups.data!.data.map((row: any) => (
-                                <div
-                                  key={row.id}
-                                  className="rounded-lg border p-2 flex items-start justify-between gap-3"
-                                >
-                                  <div className="min-w-0">
-                                    <div className="text-xs text-muted-foreground">
-                                      Cashup #{row.id} • Shift #{row.shiftId} •{" "}
-                                      {new Date(row.createdAt).toLocaleTimeString()}
-                                    </div>
-                                    <pre className="mt-1 text-xs whitespace-pre-wrap break-words max-h-40 overflow-auto">
-                                      {JSON.stringify(row.snapshot?.summary ?? row.snapshot, null, 2)}
-                                    </pre>
-                                  </div>
-                                  <div className="shrink-0 flex flex-col gap-2">
-                                    <button
-                                      type="button"
-                                      className="inline-flex items-center gap-1 px-2 py-1 rounded border hover:bg-muted text-xs"
-                                      onClick={() => mDeleteCashup.mutate(row.id)}
-                                      disabled={mDeleteCashup.isPending}
-                                      title="Delete snapshot (if supported by server)"
-                                    >
-                                      <Trash2 className="w-3 h-3" />
-                                      {mDeleteCashup.isPending ? "Deleting…" : "Delete"}
-                                    </button>
-                                    {mDeleteCashup.isError && (
-                                      <div className="text-[11px] text-red-600 max-w-[12rem]">
-                                        {(mDeleteCashup.error as any)?.message || "Failed to delete."}
-                                      </div>
-                                    )}
-                                  </div>
-                                </div>
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Original: Today's shifts (flat chips) */}
-      <div className="mb-4">
-        {todaysShifts?.data?.length ? (
-          <div className="flex flex-wrap gap-2 items-center">
-            <span className="text-sm text-muted-foreground">Today’s Shifts:</span>
-            {(todaysShifts.data as any[]).map((s) => (
-              <button
-                key={s.id}
-                onClick={() =>
-                  setShift({
-                    id: Number(s.id),
-                    date: String(s.date).slice(0, 10),
-                    employeeId: Number(s.employeeId),
-                    status: s.closedAt ? "CLOSED" : "OPEN",
-                    closedAt: s.closedAt ?? null,
-                    cashExpected: 0,
-                    cashReceived: 0,
-                    shortOver: 0,
-                    lines: [],
-                  } as any)
-                }
-                className={`px-2 py-1 rounded-full text-xs border ${
-                  shift?.id === s.id ? "bg-muted" : "bg-background hover:bg-muted"
-                }`}
-                title={`Shift #${s.id} • ${s.closedAt ? "CLOSED" : "OPEN"}`}
-              >
-                #{s.id} • {empNameById.get(Number(s.employeeId)) ?? s.employeeId} •{" "}
-                {s.closedAt ? "CLOSED" : "OPEN"}
-              </button>
-            ))}
-          </div>
-        ) : (
-          <div className="text-sm text-muted-foreground">No shifts yet today.</div>
         )}
       </div>
 
-      {/* Get/Open shift */}
-      <div className="grid grid-cols-1 sm:grid-cols-[minmax(220px,360px)_auto_auto_1fr] items-end gap-3 mb-5">
-        <div className="w-full">
-          <label htmlFor="employeeName" className="text-sm font-medium">
-            Employee
-          </label>
-          <div className="mt-1">
-            <input
-              id="employeeName"
-              list="employee-list"
-              className="w-full rounded-xl border px-3 py-2 bg-background"
-              placeholder="type name…"
-              value={employeeQuery}
-              onChange={(e) => {
-                const v = e.target.value;
-                setEmployeeQuery(v);
-                const match = employees.find(
-                  (emp) => `${emp.name} (#${emp.id})` === v || emp.name === v
-                );
-                if (match) setEmployeeId(match.id);
-              }}
-              onBlur={() => {
-                const match = employees.find(
-                  (emp) =>
-                    `${emp.name} (#${emp.id})` === employeeQuery ||
-                    emp.name === employeeQuery
-                );
-                if (match) setEmployeeId(match.id);
-              }}
-              disabled={!!shift && (shift as any)?.closedAt == null}
-              aria-disabled={!!shift && (shift as any)?.closedAt == null}
-            />
-            <datalist id="employee-list">
-              {employees.map((e) => (
-                <option key={e.id} value={`${e.name} (#${e.id})`} />
-              ))}
-            </datalist>
-            <p className="mt-1 text-xs text-muted-foreground">
-              {employeeId ? `Selected ID: ${employeeId}` : "Pick an employee"}
-            </p>
-          </div>
-        </div>
-
-        <div className="w-full">
-          <label htmlFor="waiterType" className="text-sm font-medium">
-            Waiter Type
-          </label>
-          <select
-            id="waiterType"
-            className="mt-1 w-full rounded-xl border px-3 py-2 bg-background"
-            value={waiterType}
-            onChange={(e) => setWaiterType(e.target.value as "INSIDE" | "FIELD")}
-            disabled={!!shift && (shift as any)?.closedAt == null}
-          >
-            <option value="INSIDE">INSIDE</option>
-            <option value="FIELD">FIELD</option>
-          </select>
-        </div>
-
-        <button
-          onClick={() => mGetOrOpen.mutate()}
-          disabled={!canGetShift}
-          className="rounded-xl px-4 py-2 text-white bg-brand shadow disabled:opacity-60"
-          aria-busy={mGetOrOpen.isPending}
-        >
-          {mGetOrOpen.isPending ? "Loading..." : shift ? "Get / Open Shift" : "Get Shift"}
-        </button>
-
-        {shift && (
-          <span className="text-sm text-muted-foreground sm:justify-self-end">
-            <strong>Shift #{shift.id}</strong>{" "}
-            • {isClosed ? "CLOSED" : "OPEN"} • {String((shift as any)?.date ?? todayStr()).slice(0,10)}
-          </span>
-        )}
-      </div>
-
-      {/* Quick SALE entry */}
-      <form
-        className="space-y-3"
-        onSubmit={(e) => {
-          e.preventDefault();
-          if (!itemId && itemQuery) finalizeTypedItem();
-          if (canAddSale) mAddSale.mutate();
-        }}
-      >
-        <div className="grid grid-cols-1 xl:grid-cols-[minmax(220px,360px)_repeat(3,1fr)_minmax(160px,1fr)] gap-3">
-          {/* Item search */}
-          <div>
-            <label htmlFor="itemName" className="text-sm font-medium">
-              Item
-            </label>
-            <input
-              id="itemName"
-              list="menu-items-list"
-              className="mt-1 w-full rounded-xl border px-3 py-2 bg-background"
-              placeholder="type to search…"
-              value={itemQuery}
-              onChange={(e) => {
-                const v = e.target.value;
-                setItemQuery(v);
-                const match = menuItems.find(
-                  (it: { name: string; id: any }) => `${it.name} (#${it.id})` === v || it.name === v
-                );
-                if (match) {
-                  handleItemPicked(match as ItemLite);
-                }
-              }}
-              onBlur={finalizeTypedItem}
-              disabled={!shift || isClosed}
-            />
-            <datalist id="menu-items-list">
-              {menuItems.map((it: { id: React.Key | null | undefined; name: any }) => (
-                <option key={it.id} value={`${it.name} (#${it.id})`} />
-              ))}
-            </datalist>
-            <p className="mt-1 text-xs text-muted-foreground">
-              {itemId ? `Selected: ${resolveItemName(itemId)} (#${itemId})` : "Pick an item"}
-            </p>
-          </div>
-
-          {/* Qty */}
-          <div>
-            <label htmlFor="qty" className="text-sm font-medium">
-              Qty
-            </label>
-            <input
-              id="qty"
-              type="number"
-              inputMode="decimal"
-              min={0.01}
-              step="0.01"
-              value={qty}
-              onChange={(e) => setQty(Number(e.target.value))}
-              className="mt-1 w-full rounded-xl border px-3 py-2 bg-background"
-              disabled={!shift || isClosed}
-            />
-          </div>
-
-          {/* Unit */}
-          <div>
-            <label htmlFor="unit" className="text-sm font-medium">
-              Unit
-            </label>
-            <input
-              id="unit"
-              value={unit}
-              onChange={(e) => setUnit(e.target.value)}
-              className="mt-1 w-full rounded-xl border px-3 py-2 bg-background"
-              placeholder="plate / bottle / glass"
-              disabled={!shift || isClosed}
-            />
-          </div>
-
-          {/* Unit Price */}
-          <div>
-            <label htmlFor="unitPrice" className="text-sm font-medium">
-              Unit Price
-            </label>
-            <input
-              id="unitPrice"
-              type="number"
-              inputMode="decimal"
-              step="0.01"
-              min={0}
-              value={unitPrice || ""}
-              onChange={(e) => setUnitPrice(Number(e.target.value))}
-              className="mt-1 w-full rounded-xl border px-3 py-2 bg-background"
-              placeholder="e.g. 80"
-              disabled={!shift || isClosed}
-            />
-            <p className="mt-1 text-xs text-muted-foreground">Auto-filled from menu when you pick an item.</p>
-          </div>
-
-          {/* Live Line Total */}
-          <div className="rounded-xl border p-3 flex items-center justify-between">
-            <div className="text-sm text-muted-foreground">Line Total</div>
-            <div className="text-lg font-semibold tabular-nums">
-              {fmtMoney(lineTotal)}
+      {/* Page header */}
+      <div className="mb-6">
+        <div className="rounded-2xl p-4 bg-gradient-to-r from-emerald-50 to-white border border-emerald-100 shadow-sm">
+          <div className="flex items-center gap-4">
+            <div className="rounded-full bg-white p-3 shadow-sm border">
+              <Search className="w-6 h-6 text-emerald-600" />
             </div>
-          </div>
-
-          {/* Table + submit */}
-          <div className="xl:col-span-full grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div>
-              <label htmlFor="tableCode" className="text-sm font-medium">
-                Table (inside only)
-              </label>
-              <input
-                id="tableCode"
-                value={tableCode}
-                onChange={(e) => setTableCode(e.target.value)}
-                className="mt-1 w-full rounded-xl border px-3 py-2 bg-background"
-                placeholder="A6 / A7…"
-                disabled={!shift || isClosed}
-              />
+            <div className="min-w-0">
+              <h1 className="text-2xl font-semibold text-slate-900">Daily Sales</h1>
+              <p className="text-sm text-slate-600">Fast POS for inside waiters — open shift, add items, print receipts.</p>
             </div>
-            <div className="flex items-end">
-              <button
-                type="submit"
-                disabled={!canAddSale}
-                className="w-full sm:w-auto rounded-xl px-4 py-2 text-white bg-brand shadow disabled:opacity-60"
-                aria-busy={mAddSale.isPending}
-              >
-                {mAddSale.isPending ? "Adding…" : "Add SALE line"}
-              </button>
-            </div>
-          </div>
-        </div>
 
-        {/* Inline feedback */}
-        <div className="min-h-[1.5rem] mt-1">
-          {mAddSale.isError && (
-            <span className="text-sm text-red-600">Failed to add line. Check values and try again.</span>
-          )}
-          {mAddSale.isSuccess && <span className="text-sm text-green-700">Line added.</span>}
-          {mSaveCashup.isError && (
-            <span className="text-sm text-red-600">Failed to save cash-up. Please try again.</span>
-          )}
-          {mSaveCashup.isSuccess && <span className="text-sm text-green-700">Cash-up snapshot saved.</span>}
-          {mCloseShift.isError && (
-            <span className="text-sm text-red-600">Failed to close shift. Please try again.</span>
-          )}
-          {mCloseShift.isSuccess && (
-            <span className="text-sm text-green-700">Shift closed. Use "Get Shift" to open a new one.</span>
-          )}
-          {mGetOrOpen.isError && (
-            <span className="text-sm text-red-600">
-              Couldn’t get/open a shift. Pick an employee from the list and try again.
-            </span>
-          )}
-        </div>
-      </form>
+            <div className="ml-auto flex items-center gap-2">
+              <div className="text-right mr-2 hidden sm:block">
+                <div className="text-xs text-slate-500">Today</div>
+                <div className="text-sm font-medium text-slate-800">{todayStr()}</div>
+                <div className="text-sm text-slate-600">
+                  {clock ? `${clock.time} • ${clock.date}` : ""}
+                </div>
 
-      {/* Daily rollup (whole day) */}
-      {showDaily && (
-        <div className="mt-6">
-          <div className="flex items-center justify-between gap-2 mb-2">
-            <h2 className="text-lg font-semibold">Daily Rollup ({todayStr()})</h2>
-            {qDaily.data && (
-              <div className="text-sm text-muted-foreground">
-                Lines: <strong>{toNum(qDaily.data.totals.lines)}</strong> • Cash Due:{" "}
-                <strong>{fmtMoney(qDaily.data.totals.cashDue)}</strong>
+
               </div>
+
+              <button
+                onClick={() => setShowByEmployee((s) => !s)}
+                className="inline-flex items-center gap-2 rounded-lg px-3 py-2 border bg-white hover:bg-emerald-50 shadow-sm"
+              >
+                <User2 className="w-4 h-4 text-emerald-600" />
+                <span className="text-sm">By Employee</span>
+                <ChevronDown className={`w-4 h-4 transition-transform ${showByEmployee ? "rotate-180" : ""}`} />
+              </button>
+              <button
+                onClick={() => setShowDaily((s) => !s)}
+                className="inline-flex items-center gap-2 rounded-lg px-3 py-2 border bg-white hover:bg-emerald-50 shadow-sm"
+              >
+                <History className="w-4 h-4 text-emerald-600" />
+                <span className="text-sm">Daily Rollup</span>
+                <ChevronDown className={`w-4 h-4 transition-transform ${showDaily ? "rotate-180" : ""}`} />
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Two-column layout: left summary / right main form */}
+      <div className="grid grid-cols-1 lg:grid-cols-[360px_1fr] gap-6">
+        {/* LEFT: Summary & Quick actions */}
+        <aside className="space-y-4">
+          <div className="rounded-xl border p-4 bg-white shadow-sm">
+            <div className="flex items-start gap-3">
+              <div className="flex-1">
+                <div className="text-xs text-slate-500">Current Shift</div>
+                <div className="mt-1 flex items-baseline gap-2">
+                  <div className="text-lg font-semibold text-slate-900">
+                    {shift ? `#${shift.id}` : "—"}
+                  </div>
+                  <div className="text-sm text-slate-600">{shift ? (isClosed ? "CLOSED" : "OPEN") : "No shift"}</div>
+                </div>
+                <div className="text-xs text-slate-500 mt-1">Employee</div>
+                <div className="text-sm font-medium">{empNameById.get(Number(shift?.employeeId)) ?? (shift?.employeeId ? `#${shift.employeeId}` : "—")}</div>
+                <div className="text-xs text-slate-400 mt-2">Cash Due</div>
+                <div className="text-2xl font-bold text-emerald-700">₵ {fmtMoney(summary?.totals?.cashDue ?? 0)}</div>
+              </div>
+            </div>
+
+            <div className="mt-4 flex flex-col gap-2">
+              <button
+                type="button"
+                onClick={() => mSaveCashup.mutate()}
+                disabled={!shift || !summary || mSaveCashup.isPending}
+                className="w-full inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2 bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-60"
+              >
+                <Save className="w-4 h-4" />
+                <span className="text-sm">{mSaveCashup.isPending ? "Saving…" : "Save Cash-up"}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => printReceiptForShift()}
+                disabled={!shift}
+                className="w-full inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2 border bg-white hover:bg-emerald-50"
+              >
+                <Printer className="w-4 h-4 text-emerald-600" />
+                <span className="text-sm">Print Receipt</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  if (!canCloseShift) return;
+                  if (window.confirm(`Close shift #${shift?.id ?? ""}?`)) mCloseShift.mutate();
+                }}
+                disabled={!canCloseShift}
+                className="w-full inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2 bg-red-600 text-white hover:bg-red-700 disabled:opacity-60"
+              >
+                <XCircle className="w-4 h-4" />
+                <span className="text-sm">{mCloseShift.isPending ? "Closing…" : "Close Shift"}</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Today by employee — collapsible */}
+          {showByEmployee && (
+            <div className="rounded-xl border p-3 bg-white shadow-sm">
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-semibold">Today by Employee</div>
+                <div className="text-xs text-slate-500">{todaysShifts?.data?.length ?? 0} shifts</div>
+              </div>
+
+              <div className="mt-3 space-y-2">
+                {!(todaysShifts?.data?.length ?? 0) ? (
+                  <div className="text-sm text-slate-500">No shifts yet today.</div>
+                ) : (
+                  Array.from(
+                    new Map(((todaysShifts?.data ?? []) as any[]).map((s) => [Number(s.employeeId), true] as const)).keys()
+                  )
+                    .sort((a, b) => {
+                      const an = empNameById.get(a) ?? `#${a}`;
+                      const bn = empNameById.get(b) ?? `#${b}`;
+                      return an.localeCompare(bn);
+                    })
+                    .map((empId) => {
+                      const name = empNameById.get(empId) ?? `Employee #${empId}`;
+                      const shifts = ((todaysShifts?.data ?? []) as any[]).filter((s) => Number(s.employeeId) === empId);
+                      const empTotal = totalsByEmployee.get(empId) ?? 0;
+                      return (
+                        <div key={empId} className="border rounded-lg p-2">
+                          <div className="flex items-center justify-between">
+                            <div className="text-sm font-medium">{name}</div>
+                            <div className="text-sm font-semibold tabular-nums">₵ {fmtMoney(empTotal)}</div>
+                          </div>
+                          <div className="mt-2 flex flex-wrap gap-2">
+                            {shifts.map((s: any) => {
+                              const total = shiftTotalById.get(Number(s.id)) ?? 0;
+                              const closed = !!s.closedAt;
+                              return (
+                                <button
+                                  key={s.id}
+                                  onClick={() =>
+                                    setShift({
+                                      id: Number(s.id),
+                                      date: String(s.date).slice(0, 10),
+                                      employeeId: Number(s.employeeId),
+                                      status: closed ? "CLOSED" : "OPEN",
+                                      closedAt: s.closedAt ?? null,
+                                      cashExpected: 0,
+                                      cashReceived: 0,
+                                      shortOver: 0,
+                                      lines: [],
+                                    } as any)
+                                  }
+                                  className={`px-2 py-1 rounded-full text-xs border ${
+                                    shift?.id === s.id ? "bg-emerald-50 border-emerald-200" : "bg-white hover:bg-emerald-50"
+                                  }`}
+                                  title={`Shift #${s.id} • ${closed ? "CLOSED" : "OPEN"}`}
+                                >
+                                  #{s.id} • {closed ? "CLOSED" : "OPEN"} • ₵ {fmtMoney(total)}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      );
+                    })
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Cashups when expanded */}
+          {expandedEmp != null && (
+            <div className="rounded-xl border p-3 bg-white shadow-sm">
+              <div className="text-sm font-semibold">Cash-up Snapshots</div>
+              <div className="mt-2">
+                {qEmpCashups.isFetching ? (
+                  <div className="text-sm text-slate-500">Loading…</div>
+                ) : (qEmpCashups.data?.data?.length ?? 0) === 0 ? (
+                  <div className="text-sm text-slate-500">No snapshots for today.</div>
+                ) : (
+                  qEmpCashups.data!.data.map((row: any) => (
+                    <div key={row.id} className="border rounded p-2 mb-2 flex items-start justify-between gap-2">
+                      <div>
+                        <div className="text-xs text-slate-500">Cashup #{row.id} • Shift #{row.shiftId}</div>
+                        <pre className="mt-1 text-xs whitespace-pre-wrap break-words max-h-32 overflow-auto">
+                          {JSON.stringify(row.snapshot?.summary ?? row.snapshot, null, 2)}
+                        </pre>
+                      </div>
+                      <div className="flex flex-col gap-2">
+                        <button
+                          type="button"
+                          className="inline-flex items-center gap-1 px-2 py-1 rounded border hover:bg-emerald-50 text-xs"
+                          onClick={() => mDeleteCashup.mutate(row.id)}
+                          disabled={mDeleteCashup.isPending}
+                        >
+                          <Trash2 className="w-3 h-3" />
+                          Delete
+                        </button>
+                        {mDeleteCashup.isError && <div className="text-xs text-red-600">Failed to delete.</div>}
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          )}
+        </aside>
+
+        {/* RIGHT: Main form & summary table */}
+        <main>
+          {/* Get/Open shift */}
+          <div className="rounded-xl border p-4 bg-white shadow-sm mb-4">
+            <div className="grid grid-cols-1 sm:grid-cols-[minmax(220px,420px)_200px_140px_1fr] gap-3 items-end">
+              <div>
+                <label htmlFor="employeeName" className="text-sm font-medium text-slate-700">
+                  Employee
+                </label>
+                <input
+                  id="employeeName"
+                  list="employee-list"
+                  className="mt-1 w-full rounded-lg border px-3 py-2 focus:outline-none focus:ring-2 focus:ring-emerald-200"
+                  placeholder="Type name…"
+                  value={employeeQuery}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    setEmployeeQuery(v);
+                    const match = employees.find((emp) => `${emp.name} (#${emp.id})` === v || emp.name === v);
+                    if (match) setEmployeeId(match.id);
+                  }}
+                  onBlur={() => {
+                    const match = employees.find((emp) => `${emp.name} (#${emp.id})` === employeeQuery || emp.name === employeeQuery);
+                    if (match) setEmployeeId(match.id);
+                  }}
+                  disabled={!!shift && (shift as any)?.closedAt == null}
+                />
+                <datalist id="employee-list">{employees.map((e) => (<option key={e.id} value={`${e.name} (#${e.id})`} />))}</datalist>
+                <p className="mt-1 text-xs text-slate-500">{employeeId ? `Selected ID: ${employeeId}` : "Pick an employee"}</p>
+              </div>
+
+              <div>
+                <label htmlFor="waiterType" className="text-sm font-medium text-slate-700">Waiter Type</label>
+                <select
+                  id="waiterType"
+                  className="mt-1 w-full rounded-lg border px-3 py-2 focus:outline-none focus:ring-2 focus:ring-emerald-200"
+                  value={waiterType}
+                  onChange={(e) => setWaiterType(e.target.value as "INSIDE" | "FIELD")}
+                  disabled={!!shift && (shift as any)?.closedAt == null}
+                >
+                  <option value="INSIDE">INSIDE</option>
+                  <option value="FIELD">FIELD</option>
+                </select>
+              </div>
+
+              <div className="flex items-center">
+                <button
+                  onClick={() => mGetOrOpen.mutate()}
+                  disabled={!canGetShift}
+                  className="w-full rounded-lg px-4 py-2 text-white bg-emerald-600 hover:bg-emerald-700 shadow disabled:opacity-60"
+                  aria-busy={mGetOrOpen.isPending}
+                >
+                  {mGetOrOpen.isPending ? "Loading..." : shift ? "Get / Open Shift" : "Get Shift"}
+                </button>
+              </div>
+
+              {shift && (
+                <div className="text-right text-sm text-slate-600">
+                  <div><strong>Shift #{shift.id}</strong></div>
+                  <div className="mt-1">{isClosed ? "CLOSED" : "OPEN"} • {String((shift as any)?.date ?? todayStr()).slice(0,10)}</div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Quick SALE entry card */}
+          <div className="rounded-xl border p-4 bg-white shadow-sm mb-6">
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (!itemId && itemQuery) finalizeTypedItem();
+                if (canAddSale) mAddSale.mutate();
+              }}
+              className="space-y-4"
+            >
+              <div className="grid grid-cols-1 xl:grid-cols-[minmax(220px,420px)_repeat(3,1fr)_minmax(160px,1fr)] gap-3">
+                {/* Item search */}
+                <div>
+                  <label htmlFor="itemName" className="text-sm font-medium text-slate-700">Item</label>
+                  <input
+                    id="itemName"
+                    list="menu-items-list"
+                    className="mt-1 w-full rounded-lg border px-3 py-3 focus:outline-none focus:ring-2 focus:ring-emerald-200"
+                    placeholder="Type to search…"
+                    value={itemQuery}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setItemQuery(v);
+                      const match = menuItems.find(
+                        (it: { name: string; id: any }) => `${it.name} (#${it.id})` === v || it.name === v
+                      );
+                      if (match) handleItemPicked(match as ItemLite);
+                    }}
+                    onBlur={finalizeTypedItem}
+                    disabled={!shift || isClosed}
+                    autoFocus
+                  />
+                  <datalist id="menu-items-list">
+                    {menuItems.map((it: { id: React.Key | null | undefined; name: any }) => (
+                      <option key={it.id} value={`${it.name} (#${it.id})`} />
+                    ))}
+                  </datalist>
+                  <p className="mt-1 text-xs text-slate-500">{itemId ? `Selected: ${resolveItemName(itemId)} (#${itemId})` : "Pick an item"}</p>
+                </div>
+
+                {/* Qty */}
+                <div>
+                  <label htmlFor="qty" className="text-sm font-medium text-slate-700">Qty</label>
+                  <input
+                    id="qty"
+                    type="number"
+                    inputMode="decimal"
+                    min={0.01}
+                    step="0.01"
+                    value={qty}
+                    onChange={(e) => setQty(Number(e.target.value))}
+                    className="mt-1 w-full rounded-lg border px-3 py-3 focus:outline-none focus:ring-2 focus:ring-emerald-200"
+                    disabled={!shift || isClosed}
+                  />
+                </div>
+
+                {/* Unit */}
+                <div>
+                  <label htmlFor="unit" className="text-sm font-medium text-slate-700">Unit</label>
+                  <input
+                    id="unit"
+                    value={unit}
+                    onChange={(e) => setUnit(e.target.value)}
+                    className="mt-1 w-full rounded-lg border px-3 py-3 focus:outline-none focus:ring-2 focus:ring-emerald-200"
+                    placeholder="plate / bottle / glass"
+                    disabled={!shift || isClosed}
+                  />
+                </div>
+
+                {/* Unit Price */}
+                <div>
+                  <label htmlFor="unitPrice" className="text-sm font-medium text-slate-700">Unit Price</label>
+                  <input
+                    id="unitPrice"
+                    type="number"
+                    inputMode="decimal"
+                    step="0.01"
+                    min={0}
+                    value={unitPrice || ""}
+                    onChange={(e) => setUnitPrice(Number(e.target.value))}
+                    className="mt-1 w-full rounded-lg border px-3 py-3 focus:outline-none focus:ring-2 focus:ring-emerald-200"
+                    placeholder="e.g. 80"
+                    disabled={!shift || isClosed}
+                  />
+                  <p className="mt-1 text-xs text-slate-500">Auto-filled from menu when you pick an item.</p>
+                </div>
+
+                {/* Live Line Total */}
+                <div className="rounded-lg border p-4 flex items-center justify-between bg-emerald-50">
+                  <div className="text-sm text-slate-700">Line Total</div>
+                  <div className="text-2xl font-semibold tabular-nums text-emerald-700">{fmtMoney(lineTotal)}</div>
+                </div>
+
+                {/* Table + submit */}
+                <div className="xl:col-span-full grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label htmlFor="tableCode" className="text-sm font-medium text-slate-700">Table (inside only)</label>
+                    <input
+                      id="tableCode"
+                      value={tableCode}
+                      onChange={(e) => setTableCode(e.target.value)}
+                      className="mt-1 w-full rounded-lg border px-3 py-3 focus:outline-none focus:ring-2 focus:ring-emerald-200"
+                      placeholder="A6 / A7…"
+                      disabled={!shift || isClosed}
+                    />
+                  </div>
+                  <div className="flex items-end gap-3">
+                    <button
+                      type="submit"
+                      disabled={!canAddSale}
+                      className="w-full sm:w-auto rounded-lg px-6 py-3 text-white bg-emerald-600 hover:bg-emerald-700 shadow disabled:opacity-60"
+                      aria-busy={mAddSale.isPending}
+                    >
+                      {mAddSale.isPending ? "Adding…" : "Add SALE line"}
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!shift) {
+                          flash("error", "Open a shift to print a receipt.");
+                          return;
+                        }
+                        printReceiptForShift();
+                      }}
+                      disabled={!shift}
+                      className="rounded-lg px-6 py-3 border bg-white hover:bg-emerald-50"
+                    >
+                      <Printer className="inline-block w-4 h-4 mr-2 -mt-1 text-emerald-600" />
+                      <span className="text-sm">Print Receipt</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </form>
+
+            {/* Inline feedback */}
+            <div className="mt-3 min-h-[1.4rem]">
+              {mAddSale.isError && <div className="text-sm text-red-600">Failed to add line. Check values and try again.</div>}
+              {mAddSale.isSuccess && <div className="text-sm text-emerald-700">Line added.</div>}
+              {mSaveCashup.isError && <div className="text-sm text-red-600">Failed to save cash-up. Please try again.</div>}
+              {mSaveCashup.isSuccess && <div className="text-sm text-emerald-700">Cash-up snapshot saved.</div>}
+              {mCloseShift.isError && <div className="text-sm text-red-600">Failed to close shift. Please try again.</div>}
+              {mCloseShift.isSuccess && <div className="text-sm text-emerald-700">Shift closed. Use "Get Shift" to open a new one.</div>}
+              {mGetOrOpen.isError && <div className="text-sm text-red-600">Couldn’t get/open a shift. Pick an employee from the list and try again.</div>}
+            </div>
+          </div>
+
+          {/* Daily rollup (whole day) */}
+          {showDaily && (
+            <div className="rounded-xl border p-4 bg-white shadow-sm mb-6">
+              <div className="flex items-center justify-between gap-2 mb-2">
+                <h2 className="text-lg font-semibold text-slate-800">Daily Rollup ({todayStr()})</h2>
+                {qDaily.data && (
+                  <div className="text-sm text-slate-600">
+                    Lines: <strong>{toNum(qDaily.data.totals.lines)}</strong> • Cash Due: <strong>{fmtMoney(qDaily.data.totals.cashDue)}</strong>
+                  </div>
+                )}
+              </div>
+
+              {!qDaily.isFetching && qDaily.data === null ? (
+                <p className="text-sm text-slate-500">Daily rollup endpoint not available yet on the server.</p>
+              ) : qDaily.isFetching ? (
+                <p className="text-sm text-slate-500">Loading…</p>
+              ) : qDaily.data?.byItem?.length ? (
+                <div className="overflow-x-auto">
+                  <table className="min-w-[720px] w-full border rounded-lg">
+                    <thead className="bg-emerald-50">
+                      <tr className="[&>th]:px-3 [&>th]:py-2 text-left text-sm">
+                        <th>Item</th>
+                        <th>Unit</th>
+                        <th>Price</th>
+                        <th>Sold</th>
+                        <th>Cash Due</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {qDaily.data.byItem.map((r, idx) => {
+                        const name = resolveItemName(r.itemId);
+                        return (
+                          <tr key={idx} className="[&>td]:px-3 [&>td]:py-2 border-t">
+                            <td>{name}</td>
+                            <td>{r.unit ?? ""}</td>
+                            <td>{fmtMoney(r.price)}</td>
+                            <td>{toNum((r as any).sold)}</td>
+                            <td>{fmtMoney(r.cashDue)}</td>
+                          </tr>
+                        );
+                      })}
+                      <tr className="border-t font-semibold">
+                        <td colSpan={4} className="px-3 py-2 text-right">Total</td>
+                        <td className="px-3 py-2">{fmtMoney(qDaily.data.totals.cashDue)}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p className="text-sm text-slate-500">No sales yet today.</p>
+              )}
+            </div>
+          )}
+
+          {/* Cash-up snapshot viewer (current shift) */}
+          {showCashup && shift && (
+            <div className="rounded-xl border p-4 bg-white shadow-sm mb-6">
+              <div className="flex items-center justify-between gap-2 mb-2">
+                <h2 className="text-lg font-semibold text-slate-800">Cash-up Snapshot (Shift #{shift.id})</h2>
+              </div>
+
+              {qCashup.isFetching ? (
+                <p className="text-sm text-slate-500">Loading…</p>
+              ) : qCashup.isError ? (
+                <p className="text-sm text-red-600">
+                  Couldn’t load snapshot{(qCashup.error as any)?.message ? `: ${(qCashup.error as any).message}` : "."}
+                </p>
+              ) : qCashup.data == null ? (
+                <p className="text-sm text-slate-500">No snapshot found.</p>
+              ) : (
+                <div className="rounded-lg border p-3 text-sm">
+                  {(() => {
+                    const data: any = qCashup.data;
+                    if (data && typeof data === "object" && "snapshot" in data) {
+                      return <pre className="whitespace-pre-wrap break-words">{JSON.stringify(data.snapshot, null, 2)}</pre>;
+                    }
+                    const snaps = Array.isArray(data?.snapshots) ? data.snapshots : [];
+                    if (snaps.length > 0) {
+                      return (
+                        <div className="space-y-3">
+                          {snaps.map((s: any, i: number) => (
+                            <div key={i} className="rounded-lg border p-2">
+                              <div className="text-slate-500 mb-1">Saved at: {s.at}</div>
+                              <pre className="whitespace-pre-wrap break-words">{JSON.stringify(s.payload, null, 2)}</pre>
+                            </div>
+                          ))}
+                        </div>
+                      );
+                    }
+                    return <div className="text-slate-500">No snapshot found.</div>;
+                  })()}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Summary (current shift) */}
+          <div className="rounded-xl border p-4 bg-white shadow-sm">
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-2">
+              <h2 className="text-lg font-semibold text-slate-800">Summary</h2>
+              {summary && (
+                <div className="text-sm text-slate-600">
+                  Lines: <strong>{toNum(summary.totals.lines)}</strong> • Cash Due: <strong>{fmtMoney(summary.totals.cashDue)}</strong>
+                </div>
+              )}
+            </div>
+
+            {!shift ? (
+              <p className="text-sm text-slate-500">Get a shift to see totals.</p>
+            ) : isFetching ? (
+              <p className="text-sm text-slate-500">Loading…</p>
+            ) : summary?.byItem?.length ? (
+              <div className="overflow-x-auto">
+                <table className="min-w-[720px] w-full border rounded-lg">
+                  <thead className="bg-emerald-50">
+                    <tr className="[&>th]:px-3 [&>th]:py-2 text-left text-sm">
+                      <th>Item</th>
+                      <th>Unit</th>
+                      <th>Price</th>
+                      <th>Issued</th>
+                      <th>Added</th>
+                      <th>Returned</th>
+                      <th>Sold</th>
+                      <th>Remain</th>
+                      <th>Cash Due</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {summary.byItem.map((r, idx) => {
+                      const name = resolveItemName(r.itemId);
+                      return (
+                        <tr key={idx} className="[&>td]:px-3 [&>td]:py-2 border-t">
+                          <td>{name}</td>
+                          <td>{r.unit ?? ""}</td>
+                          <td>{fmtMoney(r.price)}</td>
+                          <td>{toNum(r.issued)}</td>
+                          <td>{toNum(r.added)}</td>
+                          <td>{toNum(r.returned)}</td>
+                          <td>{toNum(r.sold)}</td>
+                          <td>{toNum(r.remaining)}</td>
+                          <td>{fmtMoney(r.cashDue)}</td>
+                        </tr>
+                      );
+                    })}
+                    <tr className="border-t font-semibold">
+                      <td colSpan={8} className="px-3 py-2 text-right">Total</td>
+                      <td className="px-3 py-2">{fmtMoney(summary.totals.cashDue)}</td>
+                    </tr>
+                  </tbody>
+                </table>
+
+                <div className="mt-3 text-xs text-slate-500">
+                  Shift #{shift?.id} • {String((shift as any)?.date ?? todayStr()).slice(0, 10)} • Employee ID: {employeeId || "—"}
+                </div>
+              </div>
+            ) : (
+              <p className="text-sm text-slate-500">No lines yet.</p>
             )}
           </div>
-          {!qDaily.isFetching && qDaily.data === null ? (
-            <p className="text-sm text-muted-foreground">
-              Daily rollup endpoint not available yet on the server.
-            </p>
-          ) : qDaily.isFetching ? (
-            <p className="text-sm text-muted-foreground">Loading…</p>
-          ) : qDaily.data?.byItem?.length ? (
-            <div className="overflow-x-auto">
-              <table className="min-w-[720px] w-full border rounded-xl">
-                <thead className="bg-muted/50">
-                  <tr className="[&>th]:px-3 [&>th]:py-2 text-left text-sm">
-                    <th>Item</th>
-                    <th>Unit</th>
-                    <th>Price</th>
-                    <th>Sold</th>
-                    <th>Cash Due</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {qDaily.data.byItem.map((r, idx) => {
-                    const name = resolveItemName(r.itemId);
-                    return (
-                      <tr key={idx} className="[&>td]:px-3 [&>td]:py-2 border-t">
-                        <td>{name}</td>
-                        <td>{r.unit ?? ""}</td>
-                        <td>{fmtMoney(r.price)}</td>
-                        <td>{toNum((r as any).sold)}</td>
-                        <td>{fmtMoney(r.cashDue)}</td>
-                      </tr>
-                    );
-                  })}
-                  <tr className="border-t font-semibold">
-                    <td colSpan={4} className="px-3 py-2 text-right">Total</td>
-                    <td className="px-3 py-2">{fmtMoney(qDaily.data.totals.cashDue)}</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <p className="text-sm text-muted-foreground">No sales yet today.</p>
-          )}
-        </div>
-      )}
-
-      {/* Cash-up snapshot viewer (current shift) */}
-      {showCashup && shift && (
-        <div className="mt-6">
-          <div className="flex items-center justify-between gap-2 mb-2">
-            <h2 className="text-lg font-semibold">Cash-up Snapshot (Shift #{shift.id})</h2>
-          </div>
-
-          {qCashup.isFetching ? (
-            <p className="text-sm text-muted-foreground">Loading…</p>
-          ) : qCashup.isError ? (
-            <p className="text-sm text-red-600">
-              Couldn’t load snapshot{(qCashup.error as any)?.message ? `: ${(qCashup.error as any).message}` : "."}
-            </p>
-          ) : qCashup.data == null ? (
-            <p className="text-sm text-muted-foreground">No snapshot found.</p>
-          ) : (
-            <div className="rounded-xl border p-3 text-sm">
-              {(() => {
-                const data: any = qCashup.data;
-                if (data && typeof data === "object" && "snapshot" in data) {
-                  return (
-                    <pre className="whitespace-pre-wrap break-words">
-                      {JSON.stringify(data.snapshot, null, 2)}
-                    </pre>
-                  );
-                }
-                const snaps = Array.isArray(data?.snapshots) ? data.snapshots : [];
-                if (snaps.length > 0) {
-                  return (
-                    <div className="space-y-3">
-                      {snaps.map((s: any, i: number) => (
-                        <div key={i} className="rounded-lg border p-2">
-                          <div className="text-muted-foreground mb-1">Saved at: {s.at}</div>
-                          <pre className="whitespace-pre-wrap break-words">
-                            {JSON.stringify(s.payload, null, 2)}
-                          </pre>
-                        </div>
-                      ))}
-                    </div>
-                  );
-                }
-                return <div className="text-muted-foreground">No snapshot found.</div>;
-              })()}
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Summary (current shift) */}
-      <div className="mt-6">
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-2">
-          <h2 className="text-lg font-semibold">Summary</h2>
-          {summary && (
-            <div className="text-sm text-muted-foreground">
-              Lines: <strong>{toNum(summary.totals.lines)}</strong> • Cash Due:{" "}
-              <strong>{fmtMoney(summary.totals.cashDue)}</strong>
-            </div>
-          )}
-        </div>
-
-        {!shift ? (
-          <p className="text-sm text-muted-foreground">Get a shift to see totals.</p>
-        ) : isFetching ? (
-          <p className="text-sm text-muted-foreground">Loading…</p>
-        ) : summary?.byItem?.length ? (
-          <div className="overflow-x-auto">
-            <table className="min-w-[720px] w-full border rounded-xl print:min-w-full">
-              <thead className="bg-muted/50">
-                <tr className="[&>th]:px-3 [&>th]:py-2 text-left text-sm">
-                  <th>Item</th>
-                  <th>Unit</th>
-                  <th>Price</th>
-                  <th>Issued</th>
-                  <th>Added</th>
-                  <th>Returned</th>
-                  <th>Sold</th>
-                  <th>Remain</th>
-                  <th>Cash Due</th>
-                </tr>
-              </thead>
-              <tbody>
-                {summary.byItem.map((r, idx) => {
-                  const name = resolveItemName(r.itemId);
-                  return (
-                    <tr key={idx} className="[&>td]:px-3 [&>td]:py-2 border-t">
-                      <td>{name}</td>
-                      <td>{r.unit ?? ""}</td>
-                      <td>{fmtMoney(r.price)}</td>
-                      <td>{toNum(r.issued)}</td>
-                      <td>{toNum(r.added)}</td>
-                      <td>{toNum(r.returned)}</td>
-                      <td>{toNum(r.sold)}</td>
-                      <td>{toNum(r.remaining)}</td>
-                      <td>{fmtMoney(r.cashDue)}</td>
-                    </tr>
-                  );
-                })}
-                <tr className="border-t font-semibold">
-                  <td colSpan={8} className="px-3 py-2 text-right">
-                    Total
-                  </td>
-                  <td className="px-3 py-2">{fmtMoney(summary.totals.cashDue)}</td>
-                </tr>
-              </tbody>
-            </table>
-
-            <div className="mt-3 text-xs text-muted-foreground print:text-[10pt]">
-              Shift #{shift?.id} • {String((shift as any)?.date ?? todayStr()).slice(0,10)} • Employee ID:{" "}
-              {employeeId || "—"}
-            </div>
-          </div>
-        ) : (
-          <p className="text-sm text-muted-foreground">No lines yet.</p>
-        )}
+        </main>
       </div>
     </DashboardShell>
   );

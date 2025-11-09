@@ -2,59 +2,19 @@
 import { Router } from "express";
 import { PrismaClient } from "@prisma/client";
 import { validateBody } from "../utils/validate.js";
+import { z } from "zod";
 import { zFieldDispatchCreate } from "../schemas/index.js";
-import { withItemLock, getStockOnHand } from "../services/inventory.js";
 import { writeLimiter } from "../middlewares/rateLimit.js";
 import { requireAuth, requireAdmin } from "../middlewares/auth.js";
 
 const prisma = new PrismaClient();
 const r = Router();
 
-/* ----------------------- Helpers ----------------------- */
-// Keep file self-contained (same pattern as other routes)
-function toInt(v: any, d: number) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : d;
-}
-
-function getPageParams(q: any) {
-  // Preserve original behavior: only paginate if page or pageSize/limit provided
-  const hasPaging = q.page !== undefined || q.pageSize !== undefined || q.limit !== undefined;
-
-  const page = Math.max(1, toInt(q.page ?? 1, 1));
-  const rawLimit = q.limit ?? q.pageSize ?? 20; // accept alias in INPUT
-  const limit = Math.min(100, Math.max(1, toInt(rawLimit, 20)));
-
-  const skip = (page - 1) * limit;
-  const take = limit;
-
-  return { hasPaging, page, limit, skip, take };
-}
-
-function pageMeta(total: number, page: number, limit: number) {
-  const pages = Math.max(1, Math.ceil((total || 0) / (limit || 1)));
-  return {
-    total,
-    page,
-    limit, // normalized (no pageSize in meta)
-    pages,
-    hasNext: page < pages,
-    hasPrev: page > 1,
-  };
-}
-
-/** Robust money → string serializer (Decimal | number | string | null | undefined) */
+/* ---------------- helpers ---------------- */
 function moneyToString(v: any): string | null {
-  if (v === null || v === undefined) return null;
-  // Prisma Decimal has toString(); numbers/strings are fine
-  try {
-    return String(v);
-  } catch {
-    // Fallback: best-effort
-    return v != null ? `${v}` : null;
-  }
+  if (v == null) return null;
+  try { return String(v); } catch { return `${v}`; }
 }
-
 function serializeDispatch(row: any) {
   return {
     id: row.id,
@@ -62,103 +22,154 @@ function serializeDispatch(row: any) {
     waiterId: row.waiterId,
     itemId: row.itemId,
     qtyDispatched: Number(row.qtyDispatched),
-    priceEach: moneyToString((row as any).priceEach), // <- always string or null
+    priceEach: moneyToString(row.priceEach),
     createdAt: row.createdAt,
-    updatedAt: row.updatedAt,
+    itemName: row.item?.name ?? row.itemName ?? undefined,
+    returned: !!row.return,
   };
 }
 
-/* ------------------------ Routes ----------------------- */
-/**
- * GET /api/field-dispatch
- * Filters: ?waiterId=&itemId=
- * Pagination: ?page=&limit=  (pageSize alias accepted)
- * Behavior:
- *  - No paging params -> plain array (original behavior)
- *  - With paging params -> { data, meta }
- */
+/** Build an inclusive day range [start, end) in UTC from a YYYY-MM-DD (or “today”). */
+function buildDayRange(params: { day?: string; dateISO?: string }) {
+  const isToday = (params.day || "").toLowerCase() === "today";
+  const iso = params.dateISO && /^\d{4}-\d{2}-\d{2}$/.test(params.dateISO) ? params.dateISO : null;
+
+  const base = iso ? new Date(`${iso}T00:00:00.000Z`) : new Date();
+  // Use UTC to avoid TZ drift across servers
+  const start = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate(), 0, 0, 0, 0));
+  const end = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate() + 1, 0, 0, 0, 0));
+
+  return { hasDayFilter: isToday || !!iso, start, end };
+}
+
+/* ---------------- list: supports ?waiterId, ?itemId, ?day=today, ?date=YYYY-MM-DD ---------------- */
 r.get("/", async (req, res) => {
-  const waiterId = req.query.waiterId ? Number(req.query.waiterId) : undefined;
-  const itemId = req.query.itemId ? Number(req.query.itemId) : undefined;
-
-  const where: any = {};
-  if (!Number.isNaN(waiterId) && waiterId !== undefined) where.waiterId = waiterId;
-  if (!Number.isNaN(itemId) && itemId !== undefined) where.itemId = itemId;
-
-  const { hasPaging, page, limit, skip, take } = getPageParams(req.query);
-
   try {
-    if (!hasPaging) {
-      // ✅ Original behavior: return full array when no pagination params
-      const rows = await prisma.fieldDispatch.findMany({
-        where,
-        orderBy: { id: "desc" },
-      });
-      return res.json(rows.map(serializeDispatch));
-    }
+    const waiterId = req.query.waiterId ? Number(req.query.waiterId) : undefined;
+    const itemId   = req.query.itemId   ? Number(req.query.itemId)   : undefined;
+    const day      = String(req.query.day || "");
+    const dateISO  = String(req.query.date || "");
 
-    // ✅ Paginated response
-    const [rows, total] = await Promise.all([
-      prisma.fieldDispatch.findMany({ where, orderBy: { id: "desc" }, skip, take }),
-      prisma.fieldDispatch.count({ where }),
-    ]);
+    const { hasDayFilter, start, end } = buildDayRange({ day, dateISO });
 
-    return res.json({
-      data: rows.map(serializeDispatch),
-      meta: pageMeta(total, page, limit),
+    const where: any = {};
+    if (Number.isFinite(waiterId)) where.waiterId = waiterId as number;
+    if (Number.isFinite(itemId))   where.itemId   = itemId   as number;
+    if (hasDayFilter) where.date = { gte: start, lt: end };
+
+    const rows = await prisma.fieldDispatch.findMany({
+      where,
+      orderBy: hasDayFilter ? { id: "asc" } : { id: "desc" },
+      select: {
+        id: true, date: true, waiterId: true, itemId: true,
+        qtyDispatched: true, priceEach: true, createdAt: true,
+        item: { select: { name: true } },
+        return: { select: { id: true } },
+      },
     });
+
+    return res.json(rows.map(serializeDispatch));
   } catch (e: any) {
     console.error("GET /field-dispatch error:", e);
-    return res
-      .status(500)
-      .json({ error: "failed_to_fetch_field_dispatch", detail: e?.message });
+    return res.status(500).json({ error: "failed_to_fetch_field_dispatch", detail: e?.message });
   }
 });
 
-/** POST /api/field-dispatch */
+/* ---------------- explicit /today (same logic; supports ?waiterId, ?date=YYYY-MM-DD) ---------------- */
+r.get("/today", async (req, res) => {
+  try {
+    const waiterId = req.query.waiterId ? Number(req.query.waiterId) : undefined;
+    const dateISO  = String(req.query.date || "");
+    const { start, end } = buildDayRange({ day: "today", dateISO });
+
+    const where: any = { date: { gte: start, lt: end } };
+    if (Number.isFinite(waiterId)) where.waiterId = waiterId as number;
+
+    const rows = await prisma.fieldDispatch.findMany({
+      where,
+      orderBy: { id: "asc" },
+      select: {
+        id: true, date: true, waiterId: true, itemId: true,
+        qtyDispatched: true, priceEach: true, createdAt: true,
+        item: { select: { name: true } },
+        return: { select: { id: true } },
+      },
+    });
+
+    return res.json(rows.map(serializeDispatch));
+  } catch (e: any) {
+    console.error("GET /field-dispatch/today error:", e);
+    return res.status(500).json({ error: "failed_to_fetch_today_dispatch", detail: e?.message });
+  }
+});
+
+/* ---------------- create dispatch (decoupled from inventory) ---------------- */
 r.post(
   "/",
-  requireAuth,
-  requireAdmin,
-  writeLimiter,
+  requireAuth, requireAdmin, writeLimiter,
   validateBody(zFieldDispatchCreate),
   async (req, res) => {
     const { date, waiterId, itemId, qtyDispatched, priceEach } = req.body;
-
     try {
-      const created = await withItemLock(prisma, Number(itemId), async (tx) => {
-        const onHand = await getStockOnHand(tx, Number(itemId));
-        if (onHand < qtyDispatched) {
-          return res.status(409).json({
-            error: "insufficient_stock",
-            message: `Stock on hand ${onHand} is less than requested ${qtyDispatched} (dispatch)`,
-            itemId: Number(itemId),
-            stockOnHand: onHand,
-            attemptedDecrease: qtyDispatched,
-          });
-        }
-        return tx.fieldDispatch.create({
-          data: {
-            date: date ? new Date(date) : new Date(),
-            waiterId: Number(waiterId),
-            itemId: Number(itemId),
-            qtyDispatched,
-            priceEach,
-          },
-        });
+      const created = await prisma.fieldDispatch.create({
+        data: {
+          date: date ? new Date(date) : new Date(),
+          waiterId: Number(waiterId),
+          itemId: Number(itemId),
+          qtyDispatched,
+          priceEach,
+        },
       });
-
-      if ((created as any)?.json) return; // response already sent inside tx
       return res.status(201).json(serializeDispatch(created));
     } catch (e: any) {
       console.error("POST /field-dispatch error:", e);
-      return res
-        .status(500)
-        .json({ error: "failed_to_create_field_dispatch", detail: e?.message });
+      return res.status(500).json({ error: "failed_to_create_field_dispatch", detail: e?.message });
+    }
+  }
+);
+
+/* ---------------- create return ---------------- */
+const zReturnCreate = z.object({
+  cashCollected: z.number().nonnegative(),
+  qtyReturned:   z.number().nonnegative().optional().default(0),
+  lossQty:       z.number().nonnegative().optional().default(0),
+  note:          z.string().nullable().optional(),
+});
+
+r.post(
+  "/:id/return",
+  requireAuth, requireAdmin, writeLimiter,
+  validateBody(zReturnCreate),
+  async (req, res) => {
+    const dispatchId = Number(req.params.id);
+    const { cashCollected, qtyReturned = 0, lossQty = 0, note = null } = req.body;
+
+    try {
+      const dispatch = await prisma.fieldDispatch.findUnique({ where: { id: dispatchId } });
+      if (!dispatch) return res.status(404).json({ error: "dispatch_not_found" });
+
+      const created = await prisma.fieldReturn.create({
+        data: { dispatchId, qtyReturned, lossQty, cashCollected, note },
+      });
+
+      return res.status(201).json({
+        id: created.id,
+        dispatchId,
+        qtyReturned: Number(created.qtyReturned),
+        lossQty: Number(created.lossQty),
+        cashCollected: Number(created.cashCollected),
+        note: created.note ?? null,
+        createdAt: created.createdAt,
+      });
+    } catch (e: any) {
+      if (String(e?.code) === "P2002") {
+        return res.status(409).json({ error: "return_already_exists", message: "This dispatch already has a return." });
+      }
+      console.error("POST /field-dispatch/:id/return error:", e);
+      return res.status(500).json({ error: "failed_to_create_field_return", detail: e?.message });
     }
   }
 );
 
 export default r;
-// apps/api/src/routes/fieldDispatch.ts
 export { serializeDispatch };

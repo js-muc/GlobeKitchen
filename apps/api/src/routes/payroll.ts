@@ -1,6 +1,6 @@
 // apps/api/src/routes/payroll.ts
 import { Router } from "express";
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, WaiterType, CommissionRole } from "@prisma/client";
 import { requireAuth, requireAdmin } from "../middlewares/auth.js";
 import { writeLimiter } from "../middlewares/rateLimit.js";
 import { zPayrollRunParams, zPayrollRerun } from "../schemas/payroll.js";
@@ -23,7 +23,138 @@ if (!prun || !pline || !emp) {
 }
 
 /* ============================================================================
-   Helpers
+   Commission helpers (BRACKETS ONLY)
+============================================================================ */
+type Bracket = { min: number; max: number; fixed: number };
+
+function parseBracketsJson(raw: any): Bracket[] {
+  if (!raw) return [];
+  if (Array.isArray(raw)) {
+    return raw
+      .map((b) => ({
+        min: Number((b as any)?.min ?? NaN),
+        max: Number((b as any)?.max ?? NaN),
+        fixed: Number((b as any)?.fixed ?? NaN),
+      }))
+      .filter((b) => Number.isFinite(b.min) && Number.isFinite(b.max) && Number.isFinite(b.fixed))
+      .sort((a, b) => a.min - b.min);
+  }
+  try {
+    return parseBracketsJson(JSON.parse(String(raw)));
+  } catch {
+    return [];
+  }
+}
+
+async function getDefaultPlan(role: CommissionRole) {
+  return prisma.commissionPlan.findFirst({ where: { role, isDefault: true } });
+}
+
+/** Inclusive bracket match: min <= value <= max */
+function matchBracket(brackets: Bracket[], value: number): Bracket | null {
+  for (const b of brackets) {
+    if (value >= b.min && value <= b.max) return b;
+  }
+  return null;
+}
+
+/* ============================================================================
+   Data aggregation (per-day)
+============================================================================ */
+
+/** Inside daily net per waiter.
+ *  Primary: Shift (waiterType=INSIDE, netSales).
+ *  Fallback: TableSale aggregate per waiter per date (gross - discount).
+ */
+async function getInsideDailyNet(start: Date, end: Date) {
+  // PRIMARY: Shift
+  const shifts = await prisma.shift.findMany({
+    where: {
+      waiterType: WaiterType.INSIDE,
+      date: { gte: start, lt: end },
+    },
+    select: { employeeId: true, date: true, netSales: true },
+  });
+
+  const byEmpDay = new Map<number, Map<string, number>>();
+  for (const r of shifts) {
+    const id = Number(r.employeeId);
+    const d = new Date(r.date);
+    const key = d.toISOString().slice(0, 10);
+    const amt = Number(r.netSales ?? 0);
+    if (!byEmpDay.has(id)) byEmpDay.set(id, new Map());
+    const m = byEmpDay.get(id)!;
+    m.set(key, (m.get(key) ?? 0) + amt);
+  }
+
+  // If we already have data from Shift, return it.
+  let hasAny = false;
+  for (const m of byEmpDay.values()) { if (m.size) { hasAny = true; break; } }
+  if (hasAny) return byEmpDay;
+
+  // FALLBACK: TableSale → sum per waiter per date: (qty*priceEach) - discount
+  const rows = await prisma.$queryRawUnsafe<any[]>(
+    `
+    SELECT
+      "waiterId"                                        AS "employeeId",
+      DATE("date")                                      AS "d",
+      COALESCE(SUM("qty" * COALESCE("priceEach",0)),0)  AS "gross",
+      COALESCE(SUM(COALESCE("discount",0)),0)           AS "discount"
+    FROM "TableSale"
+    WHERE "date" >= $1 AND "date" < $2
+    GROUP BY "waiterId", DATE("date")
+    ORDER BY "waiterId", DATE("date");
+    `,
+    start,
+    end
+  );
+
+  for (const r of rows) {
+    const id = Number(r.employeeId);
+    const key = String(r.d);
+    const net = Math.max(Number(r.gross || 0) - Number(r.discount || 0), 0);
+    if (!byEmpDay.has(id)) byEmpDay.set(id, new Map());
+    const m = byEmpDay.get(id)!;
+    m.set(key, (m.get(key) ?? 0) + net);
+  }
+
+  return byEmpDay; // Map<empId, Map<dateISO, net>>
+}
+
+/** Field daily cash per waiter by joining FieldReturn→FieldDispatch(waiterId).
+ *  Your DB has NO fr.date column → use createdAt only.
+ */
+async function getFieldDailyCash(start: Date, end: Date) {
+  const rows = await prisma.$queryRawUnsafe<any[]>(
+    `
+    SELECT
+      fd."waiterId"               AS "employeeId",
+      DATE(fr."createdAt")        AS "d",
+      COALESCE(SUM(fr."cashCollected"), 0) AS "cash"
+    FROM "FieldReturn" fr
+    JOIN "FieldDispatch" fd ON fd.id = fr."dispatchId"
+    WHERE fr."createdAt" >= $1 AND fr."createdAt" < $2
+    GROUP BY fd."waiterId", DATE(fr."createdAt")
+    ORDER BY fd."waiterId", DATE(fr."createdAt");
+    `,
+    start,
+    end
+  );
+
+  const map = new Map<number, Map<string, number>>();
+  for (const r of rows) {
+    const id = Number(r.employeeId);
+    const key = String(r.d);
+    const amt = Number(r.cash ?? 0);
+    if (!map.has(id)) map.set(id, new Map());
+    const inner = map.get(id)!;
+    inner.set(key, (inner.get(key) ?? 0) + amt);
+  }
+  return map; // Map<empId, Map<dateISO, cash>>
+}
+
+/* ============================================================================
+   Serializers
 ============================================================================ */
 function serializeLine(row: any) {
   return {
@@ -49,46 +180,34 @@ function serializeRun(run: any, lines: any[] = []) {
   };
 }
 
-/** Fetch lines by run id; supports both `payrollRunId` and legacy `runId`. */
+/** Fetch lines by run id.
+ *  Try modern FK (`payrollRunId`). If none found, raw-query legacy `runId`.
+ */
 async function getLinesForRun(runId: number): Promise<any[]> {
   try {
-    return await (pline as any).findMany({
+    const modern = await (pline as any).findMany({
       where: { payrollRunId: runId },
       orderBy: { id: "asc" },
     });
+    if (modern && modern.length) return modern;
   } catch {
-    try {
-      return await (pline as any).findMany(
-        { where: { runId }, orderBy: { id: "asc" } } as any
-      );
-    } catch (e) {
-      console.error("getLinesForRun failed for both FK names:", e);
-      return [];
-    }
+    // ignore and try legacy
   }
-}
 
-/**
- * Robustly resolve a PayrollRun by (year, month).
- * Tries the named compound unique key first, falls back to findFirst.
- */
-async function getRunByPeriod(client: any, year: number, month: number) {
-  // Try named compound unique key (recommended)
   try {
-    return await client.payrollRun.findUnique({
-      where: { unique_period: { periodYear: year, periodMonth: month } },
-    });
-  } catch (e: any) {
-    // If the generated client doesn’t recognize the named key yet,
-    // fall back to findFirst (functionally equivalent for our purpose).
-    return await client.payrollRun.findFirst({
-      where: { periodYear: year, periodMonth: month },
-    });
+    const legacy = await prisma.$queryRawUnsafe<any[]>(
+      `SELECT * FROM "PayrollLine" WHERE "runId" = $1 ORDER BY "id" ASC;`,
+      runId
+    );
+    return legacy;
+  } catch (e) {
+    console.error("getLinesForRun legacy raw query failed:", e);
+    return [];
   }
 }
 
 /* ============================================================================
-   GET /api/payroll — list (paged; optional year/month filters)
+   GET /api/payroll — list (paged)
 ============================================================================ */
 r.get("/", async (req, res) => {
   try {
@@ -119,7 +238,7 @@ r.get("/", async (req, res) => {
 });
 
 /* ============================================================================
-   GET /api/payroll/:ym — fetch a run + lines (path YYYY-M, no leading zero)
+   GET /api/payroll/:ym — fetch a run + lines (path YYYY-M)
 ============================================================================ */
 r.get("/:ym", async (req, res) => {
   try {
@@ -130,7 +249,6 @@ r.get("/:ym", async (req, res) => {
       return res.status(400).json({ error: "bad_ym_param" });
     }
 
-    // apps/api/src/routes/payroll.ts  (GET /:ym)
     const run = await prun.findFirst({ where: { periodYear: y, periodMonth: m } });
     if (!run) return res.status(404).json({ error: "payroll_run_not_found" });
 
@@ -143,8 +261,8 @@ r.get("/:ym", async (req, res) => {
 });
 
 /* ============================================================================
-   POST /api/payroll/run?year=YYYY&month=MM[&rerun=true] — admin only
-   - Idempotent when rerun=true (deletes existing for the period)
+   POST /api/payroll/run?year=YYYY&month=MM[&rerun=true] — ADMIN ONLY
+   COMMISSION-ONLY (BRACKETS): sum of **daily** bracket payouts per employee.
 ============================================================================ */
 r.post("/run", writeLimiter, requireAuth, requireAdmin, async (req, res) => {
   try {
@@ -160,18 +278,17 @@ r.post("/run", writeLimiter, requireAuth, requireAdmin, async (req, res) => {
     const { rerun = false } = zPayrollRerun.parse({ rerun: req.query.rerun });
     const userId: number | undefined = (req as any).user?.id;
 
-    // End of period (exclusive): first day of next month at 00:00:00 UTC
-    const end = new Date(Date.UTC(month === 12 ? year + 1 : year, month === 12 ? 0 : month, 1, 0, 0, 0));
+    // Period range: [start, end)
+    const start = new Date(Date.UTC(year, month - 1, 1, 0, 0, 0));
+    const end   = new Date(Date.UTC(month === 12 ? year + 1 : year, month === 12 ? 0 : month, 1, 0, 0, 0));
 
-    // Optional deduction cap (% of gross). Default 100 = no cap
     const capPct = Number(process.env.PAYROLL_DEDUCTION_CAP_PCT ?? "100");
 
     const result = await prisma.$transaction(async (tx) => {
-      // Idempotency / conflict-safe
+      // Idempotency
       if (rerun) {
         await tx.payrollRun.deleteMany({ where: { periodYear: year, periodMonth: month } });
       } else {
-        // Robust existence check: try unique key, fall back
         let already: any = null;
         try {
           already = await tx.payrollRun.findUnique({
@@ -191,16 +308,30 @@ r.post("/run", writeLimiter, requireAuth, requireAdmin, async (req, res) => {
         }
       }
 
-      // Active salaried employees
+      // Active employees
       const employees = await tx.employee.findMany({
-        where: { active: true, salaryMonthly: { gt: "0" } },
+        where: { active: true },
         orderBy: { id: "asc" },
-        select: { id: true, salaryMonthly: true },
+        select: { id: true },
       });
 
       if (!sded) throw new Error("No deduction table (salaryDeduction or deduction) present.");
 
-      // Sum of all deductions up to end (grouped by employee)
+      // Load default bracket plans
+      const [insidePlan, fieldPlan] = await Promise.all([
+        getDefaultPlan(CommissionRole.INSIDE),
+        getDefaultPlan(CommissionRole.FIELD),
+      ]);
+      const insideBr = parseBracketsJson(insidePlan?.bracketsJson);
+      const fieldBr  = parseBracketsJson(fieldPlan?.bracketsJson);
+
+      // Aggregate daily data
+      const [insideMap, fieldMap] = await Promise.all([
+        getInsideDailyNet(start, end),  // Map<empId, Map<dateISO, net>>
+        getFieldDailyCash(start, end),  // Map<empId, Map<dateISO, cash>>
+      ]);
+
+      // Total deductions up to end
       const grouped = await (sded as any).groupBy({
         by: ["employeeId"],
         _sum: { amount: true },
@@ -209,7 +340,7 @@ r.post("/run", writeLimiter, requireAuth, requireAdmin, async (req, res) => {
       const byEmpDeductions: Record<number, number> = Object.create(null);
       grouped.forEach((g: any) => (byEmpDeductions[g.employeeId] = Number(g._sum.amount || 0)));
 
-      // Sum already applied in prior runs (deductionsApplied)
+      // Sum already applied in prior runs
       const prevRuns = await tx.payrollRun.findMany({
         where: {
           OR: [{ periodYear: { lt: year } }, { periodYear: year, periodMonth: { lt: month } }],
@@ -228,7 +359,6 @@ r.post("/run", writeLimiter, requireAuth, requireAdmin, async (req, res) => {
             where: { payrollRunId: { in: prevIds } },
           } as any);
         } catch {
-          // Legacy FK name: runId
           prevLines = await (tx as any).payrollLine.groupBy({
             by: ["employeeId"],
             _sum: { deductionsApplied: true },
@@ -243,19 +373,41 @@ r.post("/run", writeLimiter, requireAuth, requireAdmin, async (req, res) => {
       if (userId !== undefined && userId !== null) runData.createdByUserId = userId;
       const run = await tx.payrollRun.create({ data: runData });
 
-      // Compute lines (original math + optional cap)
+      // Compute lines: SUM of **daily bracket payouts** (inside + field)
       const toCreate = employees.map((e: any) => {
-        const gross = Number(e.salaryMonthly || 0);
+        const perDayInside = insideMap.get(e.id) ?? new Map<string, number>();
+        const perDayField  = fieldMap.get(e.id)  ?? new Map<string, number>();
+
+        let insideTotal = 0;
+        for (const amt of perDayInside.values()) {
+          const b = matchBracket(insideBr, Number(amt) || 0);
+          if (b) insideTotal += b.fixed;
+        }
+
+        let fieldTotal = 0;
+        for (const amt of perDayField.values()) {
+          const b = matchBracket(fieldBr, Number(amt) || 0);
+          if (b) fieldTotal += b.fixed;
+        }
+
+        const gross = insideTotal + fieldTotal;
+
         const totalDed = byEmpDeductions[e.id] || 0;
-        const applied = byEmpApplied[e.id] || 0;
+        const applied  = byEmpApplied[e.id] || 0;
         const outstanding = Math.max(0, totalDed - applied);
 
-        const cappedOutstanding =
-          capPct >= 100 ? outstanding : Math.min(outstanding, Math.floor((capPct / 100) * gross));
+        const capAbs = capPct >= 100 ? Number.POSITIVE_INFINITY : Math.floor((capPct / 100) * gross);
+        const cappedOutstanding = Math.min(outstanding, isFinite(capAbs) ? capAbs : outstanding);
 
         const deductionsApplied = Math.min(cappedOutstanding, gross);
         const netPay = Math.max(0, gross - deductionsApplied);
         const carryForward = Math.max(0, outstanding - deductionsApplied);
+
+        const noteBits: string[] = [];
+        noteBits.push("commission-only:daily-brackets");
+        if (insideTotal > 0) noteBits.push("inside:fixed-brackets");
+        if (fieldTotal  > 0) noteBits.push("field:fixed-brackets");
+        if (carryForward > 0) noteBits.push("carryForward");
 
         return {
           payrollRunId: run.id,
@@ -264,11 +416,11 @@ r.post("/run", writeLimiter, requireAuth, requireAdmin, async (req, res) => {
           deductionsApplied,
           netPay,
           carryForward,
-          note: carryForward > 0 ? "Carry forward deductions to next month" : null,
+          note: noteBits.join(","),
         };
       });
 
-      // Insert lines — typed path first; untyped fallback for legacy FK
+      // Insert lines (typed path then legacy FK)
       if (toCreate.length) {
         try {
           await tx.payrollLine.createMany({
@@ -285,7 +437,7 @@ r.post("/run", writeLimiter, requireAuth, requireAdmin, async (req, res) => {
         } catch {
           await (tx as any).payrollLine.createMany({
             data: toCreate.map((l) => ({
-              runId: l.payrollRunId, // legacy FK
+              runId: l.payrollRunId,       // legacy FK path
               employeeId: l.employeeId,
               gross: l.gross,
               deductionsApplied: l.deductionsApplied,

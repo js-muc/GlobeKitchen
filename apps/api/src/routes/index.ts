@@ -1,7 +1,7 @@
-// apps/api/src/routes/index.ts
+// routes/index.ts
 import { Router } from "express";
 
-// NOTE: Preserve your existing file names/import styles
+// Core / existing
 import auth from "./auth.js";
 import items from "./item.js";
 import employees from "./employees.js";
@@ -12,21 +12,67 @@ import fieldDispatch from "./fieldDispatch.js";
 import fieldReturn from "./fieldReturn.js";
 import dailySalesShiftsCompat from "./dailySalesShiftsCompat.js";
 
-// NEW
+// Payroll & deductions
 import salaryDeductions from "./salaryDeductions.js";
 import payroll from "./payroll.js";
 
-// NEW: shifts (daily sales shift open/close/cashup)
+// Shifts & Stock
 import shifts from "./shifts.js";
-
-// NEW: Stock management (purchases/usage/adjustments)
 import stock from "./stock.js";
 
-import { requireAdmin } from "../middlewares/auth.js";
+// ✅ Field worker split routes (were only mounted in server.ts)
+import fieldDispatchCreate from "./fieldDispatchCreate.js";
+import fieldDispatchList from "./fieldDispatchList.js";
+import fieldDispatchReturn from "./fieldDispatchReturn.js";
+import fieldDispatchGet from "./fieldDispatchGet.js";
+import fieldCommissionDaily from "./fieldCommissionDaily.js";
+import fieldCommissionMonthly from "./fieldCommissionMonthly.js";
+import fieldSummary from "./fieldSummary.js";
+
+// ✅ Menu items quick lookup (was only in server.ts)
+import menuItemList from "./menuItemList.js";
+
+// ✅ Inside waiter commission (new)
+import commissionPlans from "./commissionPlans.js";
+
+// ✅ Order receipt print (inside waiter flow)
+import ordersPrintRouter from "./orders.print.js";
+
+import { requireAdmin, adminForMutations } from "../middlewares/auth.js";
 
 const r = Router({ mergeParams: true });
 
-/** Keep a single source of truth for the advertised mounts shown by /api/health */
+/**
+ * Backwards-compatibility forwarding:
+ * The codebase historically exposed legacy endpoints under /field-commission/*
+ * which implemented static/legacy bracket logic. To unify computation and
+ * use the canonical DB-driven commission router (commissionPlans), we rewrite
+ * incoming requests that target the legacy paths so they reach the canonical handlers.
+ *
+ * Mapping rules:
+ *  - /field-commission/daily       -> /commission/field/today (keeps daily semantics)
+ *  - /field-commission/monthly     -> /commission/field/monthly
+ *  - /field-commission/*            -> /commission/field/*
+ *
+ * This middleware is intentionally light-weight and defensive so it won't
+ * break requests if anything goes wrong.
+ */
+r.use((req, _res, next) => {
+  try {
+    if (req.url && req.url.startsWith("/field-commission")) {
+      // Map well-known legacy endpoints to canonical endpoints:
+      req.url = req.url.replace(/^\/field-commission\/daily/, "/commission/field/today");
+      req.url = req.url.replace(/^\/field-commission\/monthly/, "/commission/field/monthly");
+      // General fallback: /field-commission/... -> /commission/field/...
+      req.url = req.url.replace(/^\/field-commission/, "/commission/field");
+    }
+  } catch (err) {
+    // swallow — do not block the request pipeline on routing helper errors
+  }
+  next();
+});
+
+/** For /api/health visibility */
 const MOUNTS: string[] = [
   "/auth",
   "/items",
@@ -38,52 +84,82 @@ const MOUNTS: string[] = [
   "/field-return",
   "/salary-deductions",
   "/payroll",
-
-  // NEW
   "/stock",
   "/shifts",
   "/daily-sales/shifts",
-  "/daily-sales/shifts/for-employee", // legacy compat
+  "/daily-sales/shifts/for-employee",
+
+  // Newly exposed mounts
+  "/menu-items",
+  "/field-dispatch/create",
+  "/field-dispatch/list",
+  "/field-dispatch/return",
+  "/field-dispatch/get",
+  "/field-commission/daily",
+  "/field-commission/monthly",
+  "/commission",
+
+  // ✅ Receipt printing
+  "/orders",
 ];
 
-// --- Router-level health (verifies this router is mounted at /api) ---
+// Router-level health for this aggregator
 r.get("/health", (_req, res) => {
-  res.json({
-    ok: true,
-    service: "routes",
-    ts: new Date().toISOString(),
-    mounts: MOUNTS,
-  });
+  res.json({ ok: true, service: "routes", mounts: MOUNTS, ts: new Date().toISOString() });
 });
 
-// Public/auth
+/* ===== Public/auth ===== */
 r.use("/auth", auth);
 
-// Core admin-protected resources
-r.use("/items", requireAdmin, items);
-r.use("/employees", requireAdmin, employees);
+/* ===== Resources with mixed access (Public READ, Admin Mutations) =====
+   - Public: GET /items, GET /items/:id
+   - Admin-only: POST/PUT/PATCH/DELETE /items/...
+   - Same for /employees
+*/
+r.use("/items", adminForMutations, items);
+r.use("/employees", adminForMutations, employees);
 
-// Reporting (admin-protected)
+/* ===== Admin-protected (back-office only) ===== */
 r.use("/reports", requireAdmin, reports);
-
-// Sales & inventory flows (admin-protected)
-r.use("/stock-movements", requireAdmin, stockMovements);
 r.use("/table-sales", requireAdmin, tableSales);
 r.use("/field-dispatch", requireAdmin, fieldDispatch);
 r.use("/field-return", requireAdmin, fieldReturn);
-
-// NEW: Payroll & Deductions (admin-protected)
 r.use("/salary-deductions", requireAdmin, salaryDeductions);
 r.use("/payroll", requireAdmin, payroll);
-
-// NEW: Stock management (admin-protected)
-r.use("/stock", requireAdmin, stock);
-
-// NEW: Shifts (admin-protected; alias kept for daily-sales namespace)
 r.use("/shifts", requireAdmin, shifts);
 r.use("/daily-sales/shifts", requireAdmin, shifts);
-
-// Legacy UI compatibility endpoints for Daily Sales
 r.use("/daily-sales/shifts/for-employee", requireAdmin, dailySalesShiftsCompat);
+
+r.use("/field-dispatch", fieldDispatch);
+
+r.use("/field", fieldSummary); // mounts /api/field/...
+
+/* ===== Public Stock & Movements (per agreement) ===== */
+r.use("/stock-movements", stockMovements);
+r.use("/stock", stock);
+
+/* ===== Field worker APIs (kept open to match your server.ts usage) =====
+   NOTE: these legacy mounts are left in place for compatibility. Because of the
+   forwarding middleware above, requests sent to /field-commission/* will be
+   handled by the canonical commission handlers (commissionPlans) — ensuring
+   unified computation even if callers hit the legacy URLs.
+*/
+r.use("/field-dispatch/create", fieldDispatchCreate);
+r.use("/field-dispatch/list", fieldDispatchList);
+r.use("/field-dispatch/return", fieldDispatchReturn);
+r.use("/field-dispatch/get", fieldDispatchGet);
+r.use("/field-commission/daily", fieldCommissionDaily);
+r.use("/field-commission/monthly", fieldCommissionMonthly);
+
+/* ===== Menu items quick list (public) ===== */
+r.use("/menu-items", menuItemList);
+
+/* ===== Inside waiter commission endpoints (public read for plans; mutations likely admin inside that router) ===== */
+r.use("/commission", commissionPlans);
+
+/* ===== Order receipt print =====
+   Mounted without requireAdmin so waiters can use it if its internal auth allows.
+*/
+r.use("/orders", ordersPrintRouter); // -> POST /api/orders/:id/print
 
 export default r;

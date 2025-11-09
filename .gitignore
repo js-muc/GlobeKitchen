@@ -15,3 +15,9 @@ build/
 *.log
 .env*
 
+
+# local backups/artifacts
+*.bak
+*.zip
+openapi.json
+schema.container.prisma

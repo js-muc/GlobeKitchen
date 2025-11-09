@@ -1,5 +1,4 @@
-﻿// apps/api/src/middlewares/auth.ts
-import type { Request, Response, NextFunction } from "express";
+﻿import type { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import { ENV } from "../config/env.js";
 
@@ -67,7 +66,7 @@ function extractBearerToken(headerValue?: string): string | null {
 /** Get JWT from header or cookie */
 function getTokenFromRequest(req: Request): string | null {
   // 1) Authorization: Bearer <token>
-  const headerToken = extractBearerToken(req.headers.authorization);
+  const headerToken = extractBearerToken(req.headers.authorization as string | undefined);
   if (headerToken) return headerToken;
 
   // 2) Cookie: token=<token>
@@ -199,4 +198,75 @@ export function requireAdmin(req: RequestWithAdmin, res: Response, next: NextFun
     }
     return res.status(401).json({ error: "unauthorized" });
   }
+}
+
+/**
+ * requireEmployeeOrAdmin
+ * - Any authenticated user (employee or admin) passes.
+ */
+export function requireEmployeeOrAdmin(req: RequestWithAdmin, res: Response, next: NextFunction) {
+  try {
+    if (isBypassEnabled()) {
+      attachUser(req, res, fakeAdmin());
+      return next();
+    }
+    if (!req.user) {
+      const token = getTokenFromRequest(req);
+      if (!token) return res.status(401).json({ error: "unauthorized" });
+      const claims = verifyToken(token);
+      attachUser(req, res, claims);
+    }
+    if (!req.user) return res.status(401).json({ error: "unauthorized" });
+    return next();
+  } catch {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+}
+
+/**
+ * requireSelfOrAdmin(getOwnerId)
+ * - Admin always allowed.
+ * - For employees, only if the resource owner matches requester (e.g., employee posting their own sale).
+ */
+export function requireSelfOrAdmin(getOwnerId: (req: RequestWithAdmin) => number | undefined) {
+  return (req: RequestWithAdmin, res: Response, next: NextFunction) => {
+    try {
+      if (isBypassEnabled()) {
+        attachUser(req, res, fakeAdmin());
+        return next();
+      }
+      if (!req.user) {
+        const token = getTokenFromRequest(req);
+        if (!token) return res.status(401).json({ error: "unauthorized" });
+        const claims = verifyToken(token);
+        attachUser(req, res, claims);
+      }
+      if (!req.user) return res.status(401).json({ error: "unauthorized" });
+
+      // Admin bypass
+      if (isAdminUser(req.user)) return next();
+
+      const ownerId = getOwnerId(req);
+      if (!ownerId || ownerId !== req.user.sub) {
+        return res.status(403).json({ error: "forbidden_owner_required" });
+      }
+      return next();
+    } catch {
+      return res.status(401).json({ error: "unauthorized" });
+    }
+  };
+}
+
+/**
+ * adminForMutations
+ * - Let **GET/HEAD/OPTIONS** pass publicly.
+ * - For **POST/PUT/PATCH/DELETE**, enforce Admin.
+ * Use this to mount routers that contain both read+write, without rewriting internals.
+ */
+export function adminForMutations(req: RequestWithAdmin, res: Response, next: NextFunction) {
+  const method = req.method.toUpperCase();
+  if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
+    return next();
+  }
+  return requireAdmin(req, res, next);
 }

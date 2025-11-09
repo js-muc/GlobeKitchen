@@ -1,5 +1,6 @@
 {
   "compilerOptions": {
+    "jsx": "react-jsx",
     "baseUrl": ".",
     // 👇 Allow "@/..." to resolve from project root *and* from src/*
     "paths": { "@/*": ["./*", "src/*"] },

@@ -19,7 +19,30 @@ const REASONS = ["ADVANCE", "LOSS", "BREAKAGE", "OTHER"] as const;
 
 function money(s: string | number) {
   const n = typeof s === "string" ? Number(s) : s;
-  return Number.isFinite(n) ? (n as number).toLocaleString() : "—";
+  return Number.isFinite(n)
+    ? Number(n).toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 })
+    : "—";
+}
+
+function renderMeta(v: unknown) {
+  if (v == null) return "—";
+  if (typeof v === "string") return v || "—";
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
+}
+
+/** Safely unwrap various possible list shapes from the API type */
+function extractRows(resp?: SalaryDeductionListResponse): SalaryDeduction[] {
+  if (!resp) return [];
+  // common shapes: {data: [...]}, {items: [...]}, or an array
+  const anyResp: any = resp as any;
+  if (Array.isArray(anyResp)) return anyResp as SalaryDeduction[];
+  if (Array.isArray(anyResp.data)) return anyResp.data as SalaryDeduction[];
+  if (Array.isArray(anyResp.items)) return anyResp.items as SalaryDeduction[];
+  return [];
 }
 
 export default function DeductionsPage() {
@@ -38,10 +61,10 @@ export default function DeductionsPage() {
   const [open, setOpen] = useState(false);
 
   /* ---------------- Data ---------------- */
-  // Server: supports employeeId, page, limit (per API). Other filters are client-side.
+  // NOTE: listSalaryDeductions query type does NOT accept `limit`, so we only pass supported props.
   const qList = useQuery<SalaryDeductionListResponse>({
-    queryKey: ["salary-deductions", { page, limit, employeeId, q: dq, reason, dateFrom, dateTo }],
-    queryFn: () => listSalaryDeductions({ page, limit, employeeId }),
+    queryKey: ["salary-deductions", { page, employeeId, q: dq, reason, dateFrom, dateTo }],
+    queryFn: () => listSalaryDeductions({ page, employeeId }),
     placeholderData: keepPreviousData,
     staleTime: 10_000,
   });
@@ -50,19 +73,17 @@ export default function DeductionsPage() {
   const { map: nameMap } = useEmployeesIndex();
 
   /* ---------------- Derived ---------------- */
-  const serverRows = qList.data?.data ?? [];
-  const total = qList.data?.meta.total ?? serverRows.length; // if server doesn't give total, fallback
-  const pages = qList.data?.meta.pages ?? Math.max(1, Math.ceil(total / limit));
+  // Server rows (unfiltered)
+  const serverRows = extractRows(qList.data);
 
   // Client-side refine: reason, date range, keyword (note/meta/name)
-  const rows = useMemo(() => {
+  const filtered = useMemo(() => {
     const kw = dq.trim().toLowerCase();
     const from = dateFrom ? new Date(dateFrom) : null;
     const to = dateTo ? new Date(dateTo) : null;
 
     return serverRows.filter((d: SalaryDeduction) => {
       if (reason && d.reason !== reason) return false;
-
       if (from && new Date(d.date) < from) return false;
       if (to && new Date(d.date) > to) return false;
 
@@ -70,7 +91,7 @@ export default function DeductionsPage() {
       const hay = [
         nameMap.get(d.employeeId) ?? "",
         d.note ?? "",
-        d.meta ?? "",
+        typeof d.meta === "string" ? d.meta : JSON.stringify(d.meta ?? ""),
         d.reason ?? "",
       ]
         .join(" ")
@@ -78,6 +99,12 @@ export default function DeductionsPage() {
       return hay.includes(kw);
     });
   }, [serverRows, dq, reason, dateFrom, dateTo, nameMap]);
+
+  // Client-side pagination (since API query type didn't accept `limit`)
+  const total = filtered.length;
+  const pages = Math.max(1, Math.ceil(total / limit));
+  const start = (page - 1) * limit;
+  const rows = filtered.slice(start, start + limit);
 
   /* ---------------- Handlers ---------------- */
   const resetFilters = () => {
@@ -134,21 +161,20 @@ export default function DeductionsPage() {
 
           {/* Employee */}
           <select
-  value={employeeId ?? ""}
-  onChange={(e) => {
-    setPage(1);
-    setEmployeeId(e.target.value ? Number(e.target.value) : undefined);
-  }}
-  className="rounded-xl border px-3 py-2"
->
-  <option value="">All employees</option>
-  {Array.from<[number, string]>(nameMap.entries()).map(([id, name]) => (
-    <option key={id} value={id}>
-      {name}
-    </option>
-  ))}
-</select>
-
+            value={employeeId ?? ""}
+            onChange={(e) => {
+              setPage(1);
+              setEmployeeId(e.target.value ? Number(e.target.value) : undefined);
+            }}
+            className="rounded-xl border px-3 py-2"
+          >
+            <option value="">All employees</option>
+            {Array.from(nameMap.entries()).map(([id, name]) => (
+              <option key={id} value={id}>
+                {name}
+              </option>
+            ))}
+          </select>
 
           {/* Reason */}
           <select
@@ -252,7 +278,7 @@ export default function DeductionsPage() {
                     </span>
                   </td>
                   <td className="px-3 py-2 hidden lg:table-cell">{d.note ?? "—"}</td>
-                  <td className="px-3 py-2 hidden lg:table-cell">{d.meta ?? "—"}</td>
+                  <td className="px-3 py-2 hidden lg:table-cell">{renderMeta(d.meta)}</td>
                   <td className="px-3 py-2 text-right font-medium">{money(d.amount)}</td>
                 </tr>
               ))}
@@ -260,7 +286,7 @@ export default function DeductionsPage() {
           </table>
         </div>
 
-        {/* Pagination */}
+        {/* Pagination (client-side) */}
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <p className="text-sm text-gray-600">
             Page {page} of {pages} • {total} total
